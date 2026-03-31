@@ -7,7 +7,13 @@
 Enterprise computer vision mapping tool designed to process Ladybug 5 panoramic imagery and automatically detect electrical distribution boxes (firidas).
 
 ## Architecture Overview
-The system relies on a fine-tuned YOLOv8 model for object detection within high-resolution panoramic frames. The core innovation is the capability to translate 2D bounding boxes into precise real-world 3D WGS84 coordinates. 
+The system relies on a fine-tuned YOLOv8 model for object detection within high-resolution panoramic frames. 
+
+**Model & Training Data**
+- The production weights (`firida_detector_v4_verygood.pt`) are included directly in the repository for immediate deployment.
+- The raw dataset used for fine-tuning this model is archived externally on [Google Drive](https://drive.google.com/drive/folders/1uw5cL-kKW_8aHGDqBC2TvdWZFL8Ai68P).
+
+The core innovation is the capability to translate 2D bounding boxes into precise real-world 3D WGS84 coordinates. 
 
 The backend is built as a FastAPI multi-worker cluster (via Uvicorn) that manages long-running inference jobs as background subprocesses, communicating through a centralized state file. Spatial filtering, including clustering and deduplication, is performed using Haversine heuristics before the final vector data is exported as QGIS-ready shapefiles.
 
