@@ -20,6 +20,7 @@ IOU_THRESHOLD = 0.45
 IMAGE_WIDTH = 1280
 IMAGE_HEIGHT = 1632       
 USE_TTA = True
+BATCH_SIZE = 8
 
 # --- Hardware Orientation ---
 CAMERA_HEIGHT = 2.45      
@@ -117,6 +118,11 @@ def run_enterprise_pipeline():
     print("Initiating Object Detection & Spatial Mapping Pipeline...")
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device == 'cuda':
+        print("Hardware Configuration: Enabling PyTorch CuDNN Auto-Tuner")
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        
     use_half = True if device == 'cuda' else False
     
     model = YOLO(MODEL_PATH)
@@ -173,7 +179,8 @@ def run_enterprise_pipeline():
         # Run AI on this specific folder
         results = model.predict(
             source=folder_path, conf=CONFIDENCE, iou=IOU_THRESHOLD, 
-            imgsz=IMAGE_WIDTH, augment=USE_TTA, half=use_half, device=device, stream=True, verbose=False
+            imgsz=IMAGE_WIDTH, augment=USE_TTA, half=use_half, device=device, 
+            stream=True, verbose=False, batch=BATCH_SIZE
         )
 
         folder_detections = 0
@@ -306,6 +313,7 @@ if __name__ == "__main__":
     parser.add_argument("--folder", type=str, default=PARENT_FOLDER)
     parser.add_argument("--conf", type=float, default=CONFIDENCE)
     parser.add_argument("--cluster", type=float, default=CLUSTER_RADIUS_M)
+    parser.add_argument("--batch", type=int, default=BATCH_SIZE)
     # 1. ADD THE NEW OUTPUT ARGUMENT
     parser.add_argument("--output", type=str, required=True) 
     args = parser.parse_args()
@@ -313,6 +321,7 @@ if __name__ == "__main__":
     PARENT_FOLDER = args.folder
     CONFIDENCE = args.conf
     CLUSTER_RADIUS_M = args.cluster
+    BATCH_SIZE = args.batch
     # 2. OVERRIDE THE HARDCODED FOLDER
     OUTPUT_FOLDER = args.output 
 
