@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import logging
 import subprocess
@@ -81,7 +82,7 @@ def run_subprocess(folder_path, conf, cluster, output_dir):
     st["results_ready"] = False
     
     cmd = [
-        "python", "Gauss_UID_Backend.py",
+        sys.executable, "Gauss_UID_Backend.py",  # <--- CHANGE THIS LINE
         "--folder", folder_path,
         "--conf", str(conf / 100.0),
         "--cluster", str(cluster),
