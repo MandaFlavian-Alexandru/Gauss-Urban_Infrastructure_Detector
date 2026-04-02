@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import Image from "next/image";
 import dynamic from "next/dynamic";
 
@@ -16,6 +16,8 @@ export interface DetectionResult {
   lat: number;
   lon: number;
   clustered?: boolean;
+  verified?: boolean;
+  classification?: number;
 }
 
 // Dynamically import MapView to prevent SSR issues with Leaflet
@@ -75,8 +77,8 @@ export default function Home() {
     e.stopPropagation();
     setZoomLevel(prev => Math.min(prev + 0.5, 4));
   };
-  const handleZoomOut = (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const handleZoomOut = (e: React.MouseEvent | KeyboardEvent) => {
+    if ('stopPropagation' in e) e.stopPropagation();
     setZoomLevel(prev => Math.max(prev - 0.5, 0.5));
   };
   const handleWheel = (e: React.WheelEvent) => {
@@ -86,6 +88,59 @@ export default function Home() {
       setZoomLevel(prev => Math.max(prev - 0.2, 0.5));
     }
   };
+
+  const handleToggleVerify = useCallback(() => {
+    if (selectedIndex === null) return;
+    setResultsData(prev => {
+      const copy = [...prev];
+      copy[selectedIndex] = { ...copy[selectedIndex], verified: !copy[selectedIndex].verified };
+      return copy;
+    });
+  }, [selectedIndex]);
+
+  const handleClassify = useCallback((type: number) => {
+    if (selectedIndex === null) return;
+    setResultsData(prev => {
+      if (!prev[selectedIndex]?.verified) return prev;
+      const copy = [...prev];
+      copy[selectedIndex] = { ...copy[selectedIndex], classification: type };
+      return copy;
+    });
+  }, [selectedIndex]);
+
+  const handleDeleteCurrent = useCallback(() => {
+    if (selectedIndex === null) return;
+    const item = resultsData[selectedIndex];
+    handleDelete(item.image, item.cam_key);
+    // Auto-advance modal
+    if (resultsData.length <= 1) {
+      handleCloseLightbox();
+    } else if (selectedIndex >= resultsData.length - 1) {
+      setSelectedIndex(selectedIndex - 1);
+    }
+  }, [selectedIndex, resultsData]);
+
+  useEffect(() => {
+    if (selectedIndex === null) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "ArrowRight") handleNextImage(e as any);
+      else if (e.key === "ArrowLeft") handlePrevImage(e as any);
+      else if (e.key === " ") {
+        e.preventDefault();
+        handleToggleVerify();
+      }
+      else if (e.key.toLowerCase() === "x") {
+        e.preventDefault();
+        handleDeleteCurrent();
+      }
+      else if (['1', '2', '3', '4'].includes(e.key)) {
+        e.preventDefault();
+        handleClassify(parseInt(e.key));
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [selectedIndex, resultsData, handleToggleVerify, handleDeleteCurrent, handleClassify]);
 
   const handleStartAnalysis = async () => {
     if (!folderPath) {
@@ -177,9 +232,7 @@ export default function Home() {
   };
 
   const handleDelete = async (image_name: string, cam_key: string) => {
-    // Optimistic UI updates
-    const newResults = resultsData.filter(d => !(d.image === image_name && d.cam_key === cam_key));
-    setResultsData(newResults);
+    setResultsData(prev => prev.filter(d => !(d.image === image_name && d.cam_key === cam_key)));
     
     try {
       await fetch("http://localhost:8000/api/delete_result", {
@@ -189,6 +242,26 @@ export default function Home() {
       });
     } catch (e) {
       console.error("Failed to sync deletion with backend:", e);
+    }
+  };
+
+  const allVerifiedAndClassified = resultsData.length > 0 && resultsData.every(r => r.verified && r.classification);
+
+  const handleGenerateFinalExport = async () => {
+    if (!allVerifiedAndClassified) return;
+    
+    try {
+      const res = await fetch("http://localhost:8000/api/generate_final_export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ results: resultsData })
+      });
+      if (!res.ok) throw new Error("Failed to generate export");
+      
+      window.location.href = "http://localhost:8000/api/download_shapefile";
+    } catch(e) {
+      console.error(e);
+      alert("Error exporting data");
     }
   };
 
@@ -446,19 +519,20 @@ export default function Home() {
 
                 <div className="bg-brand-primary p-6 rounded-xl shadow-lg relative overflow-hidden group">
                   <div className="absolute -top-10 -right-10 w-32 h-32 bg-white opacity-5 rounded-full blur-2xl group-hover:scale-150 transition-transform duration-1000"></div>
-                  <h3 className="text-white font-bold mb-2 text-lg">Master Shapefile Ready</h3>
-                  <p className="text-brand-light/90 text-sm mb-6 leading-relaxed">Local Master Map contains {resultsData.length} valid entities.</p>
-                  <a 
-                    href="http://localhost:8000/api/download_shapefile"
-                    download="Master_Firide_Map.zip"
-                    target="_blank"
-                    className="w-full bg-white text-brand-primary py-3.5 rounded-lg font-bold text-sm tracking-widest uppercase hover:shadow-xl hover:bg-gray-50 transform transition-all group-hover:-translate-y-1 flex items-center justify-center gap-3 cursor-pointer"
+                  <h3 className="text-white font-bold mb-2 text-lg">Export Deliverable</h3>
+                  <p className="text-brand-light/90 text-sm mb-6 leading-relaxed">
+                    Verify and classify all {resultsData.length} detected instances to enable export.
+                  </p>
+                  <button 
+                    onClick={handleGenerateFinalExport}
+                    disabled={!allVerifiedAndClassified}
+                    className={`w-full py-3.5 rounded-lg font-bold text-sm tracking-widest uppercase flex items-center justify-center gap-3 transition-all ${allVerifiedAndClassified ? 'bg-white text-brand-primary hover:shadow-xl hover:bg-gray-50 transform group-hover:-translate-y-1 cursor-pointer' : 'bg-white/30 text-white/50 cursor-not-allowed'}`}
                   >
-                    <svg className="w-5 h-5 text-brand-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                     </svg>
-                    Download .shp
-                  </a>
+                    Generate .shp {allVerifiedAndClassified && "Ready"}
+                  </button>
                 </div>
               </div>
             </div>
@@ -505,30 +579,44 @@ export default function Home() {
               />
             </div>
             {/* Meta overlay */}
-            <div className="absolute top-4 left-4 bg-black/60 backdrop-blur px-4 py-2 rounded-lg text-white font-mono text-sm border border-white/10 z-[110] flex flex-col gap-2">
+            <div className="absolute top-4 left-4 bg-black/60 backdrop-blur px-4 py-3 rounded-lg text-white font-mono text-sm border border-white/10 z-[110] flex flex-col gap-3 min-w-[220px]">
               <div>
                 <span className="text-brand-accent font-bold">[{selectedIndex + 1} / {resultsData.length}]</span><br/>
                 File: {resultsData[selectedIndex].image}<br/>
                 Camera: {resultsData[selectedIndex].cam_key}<br/>
                 Conf: {(resultsData[selectedIndex].conf * 100).toFixed(0)}%
               </div>
+              
+              <div className="flex flex-col gap-2 pt-2 border-t border-white/20">
+                <button 
+                  onClick={(e) => { e.stopPropagation(); handleToggleVerify(); }}
+                  className={`py-1.5 px-3 rounded text-xs font-bold uppercase transition-colors flex justify-center items-center gap-1.5 w-full border ${resultsData[selectedIndex].verified ? 'bg-green-600 border-green-500 text-white' : 'bg-gray-700 hover:bg-gray-600 border-gray-500 text-gray-300'}`}
+                >
+                  {resultsData[selectedIndex].verified ? '✓ Verified' : 'Verify (Space)'}
+                </button>
+                
+                <div className="grid grid-cols-2 gap-1.5 mt-1">
+                  {[ {id: 1, label: '1-BMPM'}, {id: 2, label: '2-BMPT'}, {id: 3, label: '3-FDCP'}, {id: 4, label: '4-FDCS'} ].map((type) => (
+                    <button
+                      key={type.id}
+                      onClick={(e) => { e.stopPropagation(); handleClassify(type.id); }}
+                      disabled={!resultsData[selectedIndex].verified}
+                      className={`text-[10px] py-1 rounded font-bold uppercase transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${resultsData[selectedIndex].classification === type.id ? 'bg-brand-primary text-white border-brand-primary' : 'bg-gray-800 hover:bg-gray-700 border-gray-600 text-gray-400'} border`}
+                    >
+                      {type.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <button 
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleDelete(resultsData[selectedIndex].image, resultsData[selectedIndex].cam_key);
-                  // Update lightbox state index gracefully
-                  if (resultsData.length <= 1) {
-                    handleCloseLightbox();
-                  } else if (selectedIndex === resultsData.length - 1) {
-                    setSelectedIndex(selectedIndex - 1);
-                  }
-                }}
-                className="bg-red-600 hover:bg-red-500 text-white px-3 py-1.5 rounded text-xs font-bold uppercase flex items-center justify-center gap-1.5 transition-colors w-full shadow border border-red-500/30"
+                onClick={(e) => { e.stopPropagation(); handleDeleteCurrent(); }}
+                className="mt-1 bg-red-600 hover:bg-red-500 text-white px-3 py-1.5 rounded text-xs font-bold uppercase flex items-center justify-center gap-1.5 transition-colors w-full shadow border border-red-500/30"
               >
                 <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                 </svg>
-                Delete Target
+                Delete Target (x)
               </button>
             </div>
           </div>

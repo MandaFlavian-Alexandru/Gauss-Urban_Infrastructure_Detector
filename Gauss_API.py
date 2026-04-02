@@ -66,9 +66,12 @@ class DeleteRequest(BaseModel):
     image_name: str
     cam_key: str
 
+class FinalExportRequest(BaseModel):
+    results: list
+
 def run_subprocess(folder_path, conf, cluster, output_dir):
     """Executes the Gauss backend pipeline as a subprocess and monitors its stdout."""
-    for f in glob.glob(os.path.join(output_dir, "Master_Firide_Map.*")): 
+    for f in glob.glob(os.path.join(output_dir, "tip_firida_bransament.*")): 
         try: 
             os.remove(f)
         except OSError as e:
@@ -172,7 +175,7 @@ def get_results():
     if not st["results_ready"] or not st["current_output_dir"]:
         return {"status": "not_ready"}
     try:
-        json_path = os.path.join(st["current_output_dir"], "Master_Firide_Map.json")
+        json_path = os.path.join(st["current_output_dir"], "tip_firida_bransament.json")
         if os.path.exists(json_path):
             with open(json_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
@@ -186,8 +189,8 @@ def delete_result(req: DeleteRequest):
     if not st["current_output_dir"]:
         return {"status": "error", "message": "No active directory"}
 
-    json_path = os.path.join(st["current_output_dir"], "Master_Firide_Map.json")
-    shp_path = os.path.join(st["current_output_dir"], "Master_Firide_Map.shp")
+    json_path = os.path.join(st["current_output_dir"], "tip_firida_bransament.json")
+    shp_path = os.path.join(st["current_output_dir"], "tip_firida_bransament.shp")
     
     if os.path.exists(json_path):
         with open(json_path, 'r', encoding='utf-8') as f:
@@ -214,11 +217,42 @@ def delete_result(req: DeleteRequest):
         return {"status": "success", "remaining": len(new_data)}
     return {"status": "error", "message": "JSON not found"}
 
+@app.post("/api/generate_final_export")
+def generate_final_export(req: FinalExportRequest):
+    st = load_state()
+    if not st["current_output_dir"]:
+        return {"status": "error", "message": "No active directory"}
+    
+    # Filter only verified and classified results
+    final_data = [d for d in req.results if d.get('verified') and d.get('classification')]
+    
+    if not final_data:
+        # Still generate an empty dataframe for zip if requested, or return error. Returning error is safer to avoid creating malformed shapefiles.
+        return {"status": "error", "message": "No verified detections to export."}
+        
+    df = pd.DataFrame(final_data)
+    geometry = [Point(xy) for xy in zip(df['lon'], df['lat'])]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry)
+    gdf.set_crs(epsg=4326, inplace=True)
+    
+    base_name = "tip_firida_bransament"
+    
+    # Overwrite the output files with the final data
+    json_path = os.path.join(st["current_output_dir"], f"{base_name}.json")
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(final_data, f)
+        
+    shp_path = os.path.join(st["current_output_dir"], f"{base_name}.shp")
+    # if it previously existed and we update, Geopandas handles overwriting cleanly mostly, but let's just use to_file
+    gdf.to_file(shp_path)
+    
+    return {"status": "success"}
+
 @app.get("/api/download_shapefile")
 def download_shapefile():
     st = load_state()
     target_dir = st["current_output_dir"]
-    base_name = "Master_Firide_Map"
+    base_name = "tip_firida_bransament"
     
     if not target_dir or not os.path.exists(os.path.join(target_dir, f"{base_name}.shp")):
         return Response(content="Shapefile not generated yet", status_code=404)

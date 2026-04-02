@@ -292,11 +292,11 @@ def run_enterprise_pipeline():
         gdf = gpd.GeoDataFrame(df_export, geometry=geometry)
         gdf.set_crs(epsg=4326, inplace=True)
         
-        shp_path = os.path.join(OUTPUT_FOLDER, "Master_Firide_Map.shp")
+        shp_path = os.path.join(OUTPUT_FOLDER, "tip_firida_bransament.shp")
         gdf.to_file(shp_path)
         
         # Export as JSON for API ingestion
-        json_path = os.path.join(OUTPUT_FOLDER, "Master_Firide_Map.json")
+        json_path = os.path.join(OUTPUT_FOLDER, "tip_firida_bransament.json")
         df_export.to_json(json_path, orient="records")
         
         print(f"Shapefile successfully generated: {shp_path}")
