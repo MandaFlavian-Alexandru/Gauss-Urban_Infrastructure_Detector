@@ -20,7 +20,7 @@ IOU_THRESHOLD = 0.45
 IMAGE_WIDTH = 1280
 IMAGE_HEIGHT = 1632       
 USE_TTA = True
-BATCH_SIZE = 8
+BATCH_SIZE = 24
 
 # --- Hardware Orientation ---
 CAMERA_HEIGHT = 2.45      

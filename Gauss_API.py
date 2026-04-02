@@ -231,6 +231,7 @@ def generate_final_export(req: FinalExportRequest):
         return {"status": "error", "message": "No verified detections to export."}
         
     df = pd.DataFrame(final_data)
+    df.rename(columns={'classification': 'Tip Firida'}, inplace=True)
     geometry = [Point(xy) for xy in zip(df['lon'], df['lat'])]
     gdf = gpd.GeoDataFrame(df, geometry=geometry)
     gdf.set_crs(epsg=4326, inplace=True)
