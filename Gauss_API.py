@@ -109,20 +109,32 @@ def run_subprocess(session_id: str, folder_path: str, las_folder_path: str, conf
         line = line.strip()
         if line:
             st = load_state(session_id) # Refresh state before updating
-            st["logs"].append(line)
-            # Keep logs manageable
-            if len(st["logs"]) > 50: 
-                st["logs"] = st["logs"][-50:]
+            
+            # Clean ANSI characters that tqdm outputs for a cleaner UI log
+            clean_log = re.sub(r'(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]', '', line)
+            
+            # Tqdm naturally emits percentage blocks, so we skip adding pure percentage strings to logs
+            if not '%' in clean_log or "[PHASE" in clean_log:
+                 st["logs"].append(clean_log)
+                 if len(st["logs"]) > 50: 
+                     st["logs"] = st["logs"][-50:]
                 
-            cam_m = re.search(r'Scanning (Camera[1-4]).*?(\d+)%', line)
+            # Regex for literal `Scanning Camera1:  63%|` outputs
+            cam_m = re.search(r'Scanning.*?(Camera[1-4]).*?(\d+)\s*%', clean_log)
             if cam_m:
                 st["camera_progress"][cam_m.group(1)] = int(cam_m.group(2))
                 
-            if "PHASE 1" in line: st["progress"] = 5
-            elif "Scanning Camera" in line: st["progress"] += 15
-            elif "PHASE 2" in line: st["progress"] = 70
-            elif "PHASE 3" in line: st["progress"] = 80
-            elif "PHASE 4" in line: st["progress"] = 95
+            if "[PHASE 1]" in clean_log: st["progress"] = 5
+            elif "[PHASE 3]" in clean_log: st["progress"] = 75
+            elif "[PHASE 4]" in clean_log: st["progress"] = 90
+            
+            # Dynamically calc phase 2 progress using tqdm stats
+            if st["progress"] < 75:
+                # Up to 400 cumulative points total across 4 cameras
+                cam_total = sum(st["camera_progress"].values())
+                cam_overall = cam_total / 400.0
+                st["progress"] = 5 + int(cam_overall * 70)
+
             save_state(session_id, st)
             
     if process.stdout:
@@ -139,24 +151,61 @@ def run_subprocess(session_id: str, folder_path: str, las_folder_path: str, conf
 
 @app.post("/api/analyze")
 def start_analysis(req: AnalysisRequest):
-    session_id = str(uuid.uuid4())
-    st = load_state(session_id)
+    if not os.path.exists(req.folder_path) or not os.path.isdir(req.folder_path):
+        return {"status": "error", "message": "Master Directory path is invalid or cannot be reached."}
+
+    recording_dirs = []
+    try:
+        sub_dirs = os.listdir(req.folder_path)
+        for subd in sub_dirs:
+            full_path = os.path.join(req.folder_path, subd)
+            if os.path.isdir(full_path):
+                # Verify if it contains valid Camera subdirectories
+                has_cameras = False
+                for inner_d in os.listdir(full_path):
+                    if "Camera" in inner_d and os.path.isdir(os.path.join(full_path, inner_d)):
+                        has_cameras = True
+                        break
+                
+                if has_cameras:
+                    recording_dirs.append({
+                        "name": subd,
+                        "path": full_path
+                    })
+    except Exception as e:
+        return {"status": "error", "message": f"Error scanning directory: {str(e)}"}
+
+    if not recording_dirs:
+         return {"status": "error", "message": "No valid recording directories containing 'CameraX' folders were found inside the Master Directory."}
+
+    sessions_started = []
     
-    st["source_folder"] = req.folder_path
-    st["las_folder"] = req.las_folder_path
-    
-    dynamic_output_dir = os.path.join(tempfile.gettempdir(), f"Gauss_App_Staging_{session_id}")
-    os.makedirs(dynamic_output_dir, exist_ok=True)
-    
-    st["current_output_dir"] = dynamic_output_dir
-    save_state(session_id, st)
-    
-    thread = threading.Thread(
-        target=run_subprocess, 
-        args=(session_id, req.folder_path, req.las_folder_path, req.min_confidence, req.cluster_radius, dynamic_output_dir)
-    )
-    thread.start()
-    return {"status": "started", "session_id": session_id}
+    for rec in recording_dirs:
+        session_id = str(uuid.uuid4())
+        st = load_state(session_id)
+        
+        st["source_folder"] = rec["path"]
+        st["las_folder"] = req.las_folder_path
+        
+        dynamic_output_dir = os.path.join(tempfile.gettempdir(), f"Gauss_App_Staging_{session_id}")
+        os.makedirs(dynamic_output_dir, exist_ok=True)
+        
+        st["current_output_dir"] = dynamic_output_dir
+        save_state(session_id, st)
+        
+        thread = threading.Thread(
+            target=run_subprocess, 
+            args=(session_id, rec["path"], req.las_folder_path, req.min_confidence, req.cluster_radius, dynamic_output_dir)
+        )
+        thread.start()
+        
+        sessions_started.append({
+            "session_id": session_id,
+            "folder_name": rec["name"],
+            "path": rec["path"]
+        })
+        
+    return {"status": "started", "sessions": sessions_started}
 
 @app.get("/api/status")
 def get_status(session_id: str):
@@ -195,39 +244,7 @@ def get_results(session_id: str):
         return {"error": str(e)}
     return []
 
-@app.post("/api/delete_result")
-def delete_result(req: DeleteRequest):
-    st = load_state(req.session_id)
-    if not st["current_output_dir"]:
-        return {"status": "error", "message": "No active directory"}
-
-    json_path = os.path.join(st["current_output_dir"], "tip_firida_bransament.json")
-    shp_path = os.path.join(st["current_output_dir"], "tip_firida_bransament.shp")
-    
-    if os.path.exists(json_path):
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            
-        new_data = [d for d in data if not (d['image'] == req.image_name and d['cam_key'] == req.cam_key)]
-        
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(new_data, f)
-            
-        df = pd.DataFrame(new_data)
-        if not df.empty:
-            geometry = [Point(xy) for xy in zip(df['lon'], df['lat'])]
-            gdf = gpd.GeoDataFrame(df, geometry=geometry)
-            gdf.set_crs(epsg=4326, inplace=True)
-            gdf.to_file(shp_path)
-        else:
-            if os.path.exists(shp_path):
-                for ext in ['.shp', '.shx', '.dbf', '.cpg', '.prj']:
-                    f_to_rem = shp_path.replace('.shp', ext)
-                    if os.path.exists(f_to_rem):
-                        os.remove(f_to_rem)
-        
-        return {"status": "success", "remaining": len(new_data)}
-    return {"status": "error", "message": "JSON not found"}
+# Removed deprecated /api/delete_result - Frontend now handles logical Soft Delete in app state!
 
 @app.post("/api/generate_final_export")
 def generate_final_export(req: FinalExportRequest):
@@ -235,6 +252,7 @@ def generate_final_export(req: FinalExportRequest):
     if not st["current_output_dir"]:
         return {"status": "error", "message": "No active directory"}
     
+    # We explicitly accept only verifications sent by the payload, bypassing the trash bin entirely!
     final_data = [d for d in req.results if d.get('verified') and d.get('classification')]
     
     if not final_data:

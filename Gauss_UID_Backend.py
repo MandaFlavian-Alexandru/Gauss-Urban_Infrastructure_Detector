@@ -168,7 +168,7 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     return R * c
 
 def run_enterprise_pipeline():
-    print("Initiating 3D Point Cloud Spatial Pipeline...")
+    print("[PHASE 1] Initializing 3D Point Cloud Spatial Pipeline...")
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if device == 'cuda':
@@ -284,7 +284,7 @@ def run_enterprise_pipeline():
         print(f"  [✓] {current_cam_key} Complete. Found {folder_detections} raw detections.")
 
     print(f"Extraction complete. {len(all_detections)} total raw detections recorded.")
-    print("Running spatial deduplication and proximity clustering...")
+    print("[PHASE 3] Running spatial deduplication and proximity clustering...")
     
     unique_firidas = []
     for det in all_detections:
@@ -337,7 +337,7 @@ def run_enterprise_pipeline():
             save_path = os.path.join(OUTPUT_FOLDER, save_filename)
             cv2.imwrite(save_path, img)
 
-    print("Compiling QGIS deliverables...")
+    print("[PHASE 4] Compiling QGIS deliverables...")
     if len(unique_firidas) > 0:
         df_export = pd.DataFrame(unique_firidas)
         df_export = df_export.drop(columns=['x1', 'y1', 'x2', 'y2', 'folder_path'])
