@@ -125,16 +125,16 @@ def calculate_gps_offset_3d(origin_x, origin_y, origin_z, car_heading, bbox_cent
     
     # Raycast Search Sequence
     if kdtree is not None and points is not None:
-        # Finer ray step resolution for exact surface impact
-        for d in np.arange(2.0, 25.0, 0.5):
+        # Ultra-fine 20cm resolution stepping for laser-guided surface impact
+        for d in np.arange(2.0, 25.0, 0.2):
             pt = [origin_x + dir_e * d, origin_y + dir_n * d, origin_z + dir_z * d]
-            # Narrower search radius prevents grabbing foreground tree leaves
-            idxs = kdtree.query_ball_point(pt, r=0.6)
+            # Extremely narrow 30cm search radius pinpoints purely the exact wall
+            idxs = kdtree.query_ball_point(pt, r=0.3)
             
-            # Strike detection: Require at least 5 points to consider it a solid object/wall
-            if len(idxs) >= 5:
+            # Strike detection: Require at least 3 points within a tiny 30cm shell
+            if len(idxs) >= 3:
                 cluster = points[idxs]
-                # We calculate the centroid ONLY on this specific concentrated strike plate
+                # We calculate the centroid ONLY on this microscopic strike plate
                 centroid_x = float(np.mean(cluster[:, 0]))
                 centroid_y = float(np.mean(cluster[:, 1]))
                 break
@@ -289,18 +289,30 @@ def run_enterprise_pipeline():
         for uf in unique_firidas:
             dist = haversine_distance(det['lat'], det['lon'], uf['lat'], uf['lon'])
             
-            if dist <= DEDUPE_RADIUS_M:
+            # Use the user-defined Auth Radius to deduplicate overlapping occurrences
+            if dist <= CLUSTER_RADIUS_M:
                 if det['image'] == uf['image'] and det['cam_key'] == uf['cam_key']:
                     continue 
                 matched = True
+                
+                # Mark as seen multiple times
+                uf['seen_count'] = uf.get('seen_count', 1) + 1
+                uf['clustered'] = True # Flags it for manual UI verification (Yellow bounding box)
+                
+                # Retain the highest confidence snapshot as the main target image
                 if det['conf'] > uf['conf']:
+                    # Carry over the clustered state to the new master det
+                    det['clustered'] = True
+                    det['seen_count'] = uf['seen_count']
                     uf.update(det) 
                 break
         
         if not matched:
             det['clustered'] = False
+            det['seen_count'] = 1
             unique_firidas.append(det)
 
+    # Secondary check to mutually flag nearby objects that weren't outright merged
     for i, f1 in enumerate(unique_firidas):
         for j, f2 in enumerate(unique_firidas):
             if i != j:

@@ -67,6 +67,7 @@ class AnalysisRequest(BaseModel):
     las_folder_path: str
     min_confidence: float
     cluster_radius: float
+    batch_size: int
 
 class DeleteRequest(BaseModel):
     session_id: str
@@ -77,7 +78,7 @@ class FinalExportRequest(BaseModel):
     session_id: str
     results: list
 
-def run_subprocess(session_id: str, folder_path: str, las_folder_path: str, conf: float, cluster: float, output_dir: str):
+def run_subprocess(session_id: str, folder_path: str, las_folder_path: str, conf: float, cluster: float, batch_size: int, output_dir: str):
     """Executes the Gauss backend pipeline as a subprocess and monitors its stdout."""
     for f in glob.glob(os.path.join(output_dir, "tip_firida_bransament.*")): 
         try: 
@@ -98,6 +99,7 @@ def run_subprocess(session_id: str, folder_path: str, las_folder_path: str, conf
         "--las_folder", las_folder_path,
         "--conf", str(conf / 100.0),
         "--cluster", str(cluster),
+        "--batch", str(batch_size),
         "--output", output_dir 
     ]
     
@@ -208,7 +210,7 @@ def start_analysis(req: AnalysisRequest):
         
         thread = threading.Thread(
             target=run_subprocess, 
-            args=(session_id, rec["path"], req.las_folder_path, req.min_confidence, req.cluster_radius, dynamic_output_dir)
+            args=(session_id, rec["path"], req.las_folder_path, req.min_confidence, req.cluster_radius, req.batch_size, dynamic_output_dir)
         )
         thread.start()
         

@@ -49,6 +49,7 @@ export default function Home() {
   const [lasFolderPath, setLasFolderPath] = useState("");
   const [minConfidence, setMinConfidence] = useState(75);
   const [parallaxRadius, setParallaxRadius] = useState(5.00);
+  const [batchSize, setBatchSize] = useState(24);
   const [isRulesExpanded, setIsRulesExpanded] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -143,7 +144,8 @@ export default function Home() {
           folder_path: folderPath,
           las_folder_path: lasFolderPath,
           min_confidence: minConfidence,
-          cluster_radius: parallaxRadius
+          cluster_radius: parallaxRadius,
+          batch_size: batchSize
         })
       });
 
@@ -400,6 +402,16 @@ export default function Home() {
                         onChange={(e) => setParallaxRadius(parseFloat(e.target.value))}
                         className="w-24 px-3 py-1.5 text-sm border border-gray-300 rounded-md focus:border-brand-primary focus:ring-1 focus:ring-brand-primary outline-none text-center font-mono" 
                         step="0.01"
+                      />
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-medium text-gray-700">System GPU Batch Size</span>
+                      <input 
+                        type="number" 
+                        value={batchSize}
+                        onChange={(e) => setBatchSize(parseInt(e.target.value) || 1)}
+                        className="w-24 px-3 py-1.5 text-sm border border-gray-300 rounded-md focus:border-brand-primary focus:ring-1 focus:ring-brand-primary outline-none text-center font-mono" 
+                        min="1" max="512" step="1"
                       />
                     </div>
                   </div>
