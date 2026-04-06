@@ -24,7 +24,7 @@ export interface Session {
   id: string;
   folderPath: string;
   lasFolderPath: string;
-  status: 'running' | 'completed' | 'error' | 'cancelled';
+  status: 'pending' | 'running' | 'completed' | 'error' | 'cancelled';
   progress: number;
   cameraProgress: {Camera1: number, Camera2: number, Camera3: number, Camera4: number};
   terminalLog: string[];
@@ -50,6 +50,7 @@ export default function Home() {
   const [minConfidence, setMinConfidence] = useState(75);
   const [parallaxRadius, setParallaxRadius] = useState(5.00);
   const [batchSize, setBatchSize] = useState(24);
+  const [executionMode, setExecutionMode] = useState<'parallel' | 'sequential'>('sequential');
   const [isRulesExpanded, setIsRulesExpanded] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -64,10 +65,10 @@ export default function Home() {
   useEffect(() => {
     const handle = setInterval(async () => {
       setSessions(prevSessions => {
-        const runningSessions = prevSessions.filter(s => s.status === 'running');
-        if (runningSessions.length === 0) return prevSessions;
+        const activeSessions = prevSessions.filter(s => s.status === 'running' || s.status === 'pending');
+        if (activeSessions.length === 0) return prevSessions;
         
-        runningSessions.forEach(async (rs) => {
+        activeSessions.forEach(async (rs) => {
           try {
             const statusRes = await fetch(`http://localhost:8000/api/status?session_id=${rs.id}`);
             const data = await statusRes.json();
@@ -82,7 +83,15 @@ export default function Home() {
                 terminalLog: data.logs || cs.terminalLog
               };
               
-              if (!data.is_running && data.results_ready && cs.status === 'running') {
+              if (data.is_running && cs.status === 'pending') {
+                  updatedSession.status = 'running';
+              }
+              
+              if (data.is_cancelled) {
+                  updatedSession.status = 'cancelled';
+              }
+              
+              if (!data.is_running && data.results_ready && (cs.status === 'running' || cs.status === 'pending')) {
                 updatedSession.status = 'completed';
                 fetchResults(rs.id, cs.startTime);
               }
@@ -145,7 +154,8 @@ export default function Home() {
           las_folder_path: lasFolderPath,
           min_confidence: minConfidence,
           cluster_radius: parallaxRadius,
-          batch_size: batchSize
+          batch_size: batchSize,
+          execution_mode: executionMode
         })
       });
 
@@ -163,10 +173,10 @@ export default function Home() {
         id: rec.session_id,
         folderPath: rec.path,
         lasFolderPath,
-        status: 'running',
+        status: executionMode === 'sequential' ? 'pending' : 'running',
         progress: 0,
         cameraProgress: {Camera1: 0, Camera2: 0, Camera3: 0, Camera4: 0},
-        terminalLog: ["Initializing API connection to local node..."],
+        terminalLog: [executionMode === 'sequential' ? "Item queued in sequential batch mode..." : "Initializing API connection to local node..."],
         resultsData: [],
         trashBin: [],
         processDuration: "0m 0s",
@@ -418,7 +428,24 @@ export default function Home() {
                 )}
               </div>
 
-              <div className="p-6 bg-gray-50 flex flex-col gap-3">
+              <div className="p-6 bg-gray-50 flex flex-col gap-4">
+                <div className="flex bg-white rounded-lg p-1 border border-gray-200">
+                  <button 
+                    type="button"
+                    onClick={() => setExecutionMode('parallel')}
+                    className={`flex-1 py-2 text-sm font-bold rounded shadow-sm transition-colors ${executionMode === 'parallel' ? 'bg-indigo-50 text-indigo-700 border border-indigo-200' : 'text-gray-500 hover:bg-gray-50'}`}
+                  >
+                    Analyze All (Parallel)
+                  </button>
+                  <button 
+                    type="button"
+                    onClick={() => setExecutionMode('sequential')}
+                    className={`flex-1 py-2 text-sm font-bold rounded shadow-sm transition-colors ${executionMode === 'sequential' ? 'bg-indigo-50 text-indigo-700 border border-indigo-200' : 'text-gray-500 hover:bg-gray-50'}`}
+                  >
+                    One-by-One (Sequential)
+                  </button>
+                </div>
+                
                 <button
                   onClick={handleStartAnalysis}
                   disabled={isSubmitting}
@@ -452,17 +479,17 @@ export default function Home() {
                              <span className="font-bold text-gray-800 break-all text-sm">{folderName}</span>
                              <span className="text-[10px] text-gray-400 font-mono mt-0.5">uuid: {s.id.split('-')[0]}</span>
                            </div>
-                           <div className={`px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${s.status === 'running' ? 'bg-blue-100 text-blue-700' : s.status === 'completed' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                           <div className={`px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${s.status === 'running' ? 'bg-blue-100 text-blue-700' : s.status === 'completed' ? 'bg-green-100 text-green-700' : s.status === 'pending' ? 'bg-gray-200 text-gray-700' : 'bg-red-100 text-red-700'}`}>
                              {s.status}
                            </div>
                          </div>
                          
-                         {s.status === 'running' && (
+                         {(s.status === 'running' || s.status === 'pending') && (
                            <>
                              <div className="flex items-center gap-3">
                                 <div className="flex-1 bg-gray-100 rounded-full h-2.5 overflow-hidden border border-gray-200 shadow-inner">
-                                   <div className="bg-blue-500 h-2.5 rounded-full transition-all duration-300 relative" style={{width: `${s.progress}%`}}>
-                                     <div className="absolute inset-0 bg-white/20 animate-pulse"></div>
+                                   <div className={`h-2.5 rounded-full transition-all duration-300 relative ${s.status === 'pending' ? 'bg-gray-300' : 'bg-blue-500'}`} style={{width: `${s.progress}%`}}>
+                                     {s.status === 'running' && <div className="absolute inset-0 bg-white/20 animate-pulse"></div>}
                                    </div>
                                 </div>
                                 <span className="font-mono font-bold text-sm text-blue-700 min-w-[36px]">{s.progress}%</span>

@@ -52,7 +52,9 @@ def load_state(session_id: str):
             "current_output_dir": "", 
             "source_folder": "",
             "las_folder": "",
-            "process_id": None
+            "process_id": None,
+            "is_pending": False,
+            "is_cancelled": False
         }
 
 def save_state(session_id: str, state):
@@ -68,6 +70,7 @@ class AnalysisRequest(BaseModel):
     min_confidence: float
     cluster_radius: float
     batch_size: int
+    execution_mode: str = "parallel"
 
 class DeleteRequest(BaseModel):
     session_id: str
@@ -87,7 +90,11 @@ def run_subprocess(session_id: str, folder_path: str, las_folder_path: str, conf
             logger.warning(f"Could not remove old file {f}: {e}")
 
     st = load_state(session_id)
+    if st.get("is_cancelled"): 
+        return
+        
     st["is_running"] = True
+    st["is_pending"] = False
     st["logs"] = [f"Initializing AI Analysis in: {folder_path}"]
     st["progress"] = 0
     st["camera_progress"] = {"Camera1": 0, "Camera2": 0, "Camera3": 0, "Camera4": 0}
@@ -151,6 +158,19 @@ def run_subprocess(session_id: str, folder_path: str, las_folder_path: str, conf
     st["process_id"] = None
     save_state(session_id, st)
 
+def run_sequential_batch(sessions_to_run):
+    """Executes a list of sessions one by one. If a user cancels one, it skips to the next."""
+    for sess in sessions_to_run:
+        # Verify it wasn't cancelled while waiting in queue
+        st = load_state(sess["session_id"])
+        if st.get("is_cancelled", False):
+            continue
+            
+        run_subprocess(
+            sess["session_id"], sess["folder_path"], sess["las_folder_path"], 
+            sess["conf"], sess["cluster"], sess["batch"], sess["output"]
+        )
+
 @app.post("/api/analyze")
 def start_analysis(req: AnalysisRequest):
     if not os.path.exists(req.folder_path) or not os.path.isdir(req.folder_path):
@@ -195,30 +215,54 @@ def start_analysis(req: AnalysisRequest):
 
     sessions_started = []
     
-    for rec in recording_dirs:
-        session_id = str(uuid.uuid4())
-        st = load_state(session_id)
-        
-        st["source_folder"] = rec["path"]
-        st["las_folder"] = req.las_folder_path
-        
-        dynamic_output_dir = os.path.join(tempfile.gettempdir(), f"Gauss_App_Staging_{session_id}")
-        os.makedirs(dynamic_output_dir, exist_ok=True)
-        
-        st["current_output_dir"] = dynamic_output_dir
-        save_state(session_id, st)
-        
-        thread = threading.Thread(
-            target=run_subprocess, 
-            args=(session_id, rec["path"], req.las_folder_path, req.min_confidence, req.cluster_radius, req.batch_size, dynamic_output_dir)
-        )
+    if req.execution_mode == "sequential":
+        sessions_to_run = []
+        for rec in recording_dirs:
+            session_id = str(uuid.uuid4())
+            st = load_state(session_id)
+            st["source_folder"] = rec["path"]
+            st["las_folder"] = req.las_folder_path
+            st["is_pending"] = True
+            
+            dynamic_output_dir = os.path.join(tempfile.gettempdir(), f"Gauss_App_Staging_{session_id}")
+            os.makedirs(dynamic_output_dir, exist_ok=True)
+            st["current_output_dir"] = dynamic_output_dir
+            save_state(session_id, st)
+            
+            sessions_started.append({"session_id": session_id, "folder_name": rec["name"], "path": rec["path"]})
+            sessions_to_run.append({
+                "session_id": session_id, "folder_path": rec["path"], "las_folder_path": req.las_folder_path, 
+                "conf": req.min_confidence, "cluster": req.cluster_radius, "batch": req.batch_size, "output": dynamic_output_dir
+            })
+            
+        thread = threading.Thread(target=run_sequential_batch, args=(sessions_to_run,))
         thread.start()
         
-        sessions_started.append({
-            "session_id": session_id,
-            "folder_name": rec["name"],
-            "path": rec["path"]
-        })
+    else:
+        for rec in recording_dirs:
+            session_id = str(uuid.uuid4())
+            st = load_state(session_id)
+            
+            st["source_folder"] = rec["path"]
+            st["las_folder"] = req.las_folder_path
+            
+            dynamic_output_dir = os.path.join(tempfile.gettempdir(), f"Gauss_App_Staging_{session_id}")
+            os.makedirs(dynamic_output_dir, exist_ok=True)
+            
+            st["current_output_dir"] = dynamic_output_dir
+            save_state(session_id, st)
+            
+            thread = threading.Thread(
+                target=run_subprocess, 
+                args=(session_id, rec["path"], req.las_folder_path, req.min_confidence, req.cluster_radius, req.batch_size, dynamic_output_dir)
+            )
+            thread.start()
+            
+            sessions_started.append({
+                "session_id": session_id,
+                "folder_name": rec["name"],
+                "path": rec["path"]
+            })
         
     return {"status": "started", "sessions": sessions_started}
 
@@ -228,6 +272,8 @@ def get_status(session_id: str):
     return {
         "session_id": session_id,
         "is_running": st["is_running"],
+        "is_pending": st.get("is_pending", False),
+        "is_cancelled": st.get("is_cancelled", False),
         "progress": min(st["progress"], 100),
         "camera_progress": st["camera_progress"],
         "logs": st["logs"][-20:],
@@ -331,6 +377,8 @@ def cancel_analysis(session_id: str = Query(...)):
             pass
             
     st["is_running"] = False
+    st["is_pending"] = False
+    st["is_cancelled"] = True
     st["camera_progress"] = {"Camera1": 0, "Camera2": 0, "Camera3": 0, "Camera4": 0}
     st["logs"].append("ERROR: Analysis cancelled by user.")
     st["process_id"] = None
