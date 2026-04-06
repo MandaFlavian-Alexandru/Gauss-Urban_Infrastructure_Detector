@@ -173,6 +173,8 @@ def run_sequential_batch(sessions_to_run):
 
 @app.post("/api/analyze")
 def start_analysis(req: AnalysisRequest):
+    print(f"*** Batch Request Received. Target Execution Mode: {req.execution_mode.upper()} ***")
+    
     if not os.path.exists(req.folder_path) or not os.path.isdir(req.folder_path):
         return {"status": "error", "message": "Directory path is invalid or cannot be reached."}
 
