@@ -10,13 +10,15 @@ import glob
 import tempfile
 import signal
 import time
+import uuid
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, FileResponse
 from pydantic import BaseModel
+from typing import Optional
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -31,15 +33,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- NEW: Centralized State Management for Clustered Workers ---
-STATE_FILE = os.path.join(tempfile.gettempdir(), "gauss_state.json")
+# --- Centralized State Management for Concurrent Sessions ---
+def get_state_file(session_id: str):
+    return os.path.join(tempfile.gettempdir(), f"gauss_state_{session_id}.json")
 
-def load_state():
+def load_state(session_id: str):
     try:
-        with open(STATE_FILE, 'r') as f:
+        with open(get_state_file(session_id), 'r') as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {
+            "session_id": session_id,
             "is_running": False,
             "progress": 0,
             "camera_progress": {"Camera1": 0, "Camera2": 0, "Camera3": 0, "Camera4": 0},
@@ -47,29 +51,33 @@ def load_state():
             "results_ready": False,
             "current_output_dir": "", 
             "source_folder": "",
+            "las_folder": "",
             "process_id": None
         }
 
-def save_state(state):
+def save_state(session_id: str, state):
     try:
-        with open(STATE_FILE, 'w') as f:
+        with open(get_state_file(session_id), 'w') as f:
             json.dump(state, f)
     except Exception:
         pass
 
 class AnalysisRequest(BaseModel):
     folder_path: str
+    las_folder_path: str
     min_confidence: float
     cluster_radius: float
 
 class DeleteRequest(BaseModel):
+    session_id: str
     image_name: str
     cam_key: str
 
 class FinalExportRequest(BaseModel):
+    session_id: str
     results: list
 
-def run_subprocess(folder_path, conf, cluster, output_dir):
+def run_subprocess(session_id: str, folder_path: str, las_folder_path: str, conf: float, cluster: float, output_dir: str):
     """Executes the Gauss backend pipeline as a subprocess and monitors its stdout."""
     for f in glob.glob(os.path.join(output_dir, "tip_firida_bransament.*")): 
         try: 
@@ -77,7 +85,7 @@ def run_subprocess(folder_path, conf, cluster, output_dir):
         except OSError as e:
             logger.warning(f"Could not remove old file {f}: {e}")
 
-    st = load_state()
+    st = load_state(session_id)
     st["is_running"] = True
     st["logs"] = [f"Initializing AI Analysis in: {folder_path}"]
     st["progress"] = 0
@@ -85,8 +93,9 @@ def run_subprocess(folder_path, conf, cluster, output_dir):
     st["results_ready"] = False
     
     cmd = [
-        sys.executable, "Gauss_UID_Backend.py",  # <--- CHANGE THIS LINE
+        sys.executable, "Gauss_UID_Backend.py",
         "--folder", folder_path,
+        "--las_folder", las_folder_path,
         "--conf", str(conf / 100.0),
         "--cluster", str(cluster),
         "--output", output_dir 
@@ -94,12 +103,12 @@ def run_subprocess(folder_path, conf, cluster, output_dir):
     
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     st["process_id"] = process.pid
-    save_state(st)
+    save_state(session_id, st)
     
     for line in iter(process.stdout.readline, ''):
         line = line.strip()
         if line:
-            st = load_state() # Refresh state before updating
+            st = load_state(session_id) # Refresh state before updating
             st["logs"].append(line)
             # Keep logs manageable
             if len(st["logs"]) > 50: 
@@ -114,42 +123,46 @@ def run_subprocess(folder_path, conf, cluster, output_dir):
             elif "PHASE 2" in line: st["progress"] = 70
             elif "PHASE 3" in line: st["progress"] = 80
             elif "PHASE 4" in line: st["progress"] = 95
-            save_state(st)
+            save_state(session_id, st)
             
     if process.stdout:
         process.stdout.close()
     process.wait()
     
-    st = load_state()
+    st = load_state(session_id)
     st["progress"] = 100
     st["camera_progress"] = {"Camera1": 100, "Camera2": 100, "Camera3": 100, "Camera4": 100}
     st["is_running"] = False
     st["results_ready"] = True
     st["process_id"] = None
-    save_state(st)
+    save_state(session_id, st)
 
 @app.post("/api/analyze")
 def start_analysis(req: AnalysisRequest):
-    st = load_state()
-    if st["is_running"]:
-        return {"status": "already_running"}
+    session_id = str(uuid.uuid4())
+    st = load_state(session_id)
     
     st["source_folder"] = req.folder_path
+    st["las_folder"] = req.las_folder_path
     
-    dynamic_output_dir = os.path.join(tempfile.gettempdir(), f"Gauss_App_Staging_{int(time.time())}")
+    dynamic_output_dir = os.path.join(tempfile.gettempdir(), f"Gauss_App_Staging_{session_id}")
     os.makedirs(dynamic_output_dir, exist_ok=True)
     
     st["current_output_dir"] = dynamic_output_dir
-    save_state(st)
+    save_state(session_id, st)
     
-    thread = threading.Thread(target=run_subprocess, args=(req.folder_path, req.min_confidence, req.cluster_radius, dynamic_output_dir))
+    thread = threading.Thread(
+        target=run_subprocess, 
+        args=(session_id, req.folder_path, req.las_folder_path, req.min_confidence, req.cluster_radius, dynamic_output_dir)
+    )
     thread.start()
-    return {"status": "started"}
+    return {"status": "started", "session_id": session_id}
 
 @app.get("/api/status")
-def get_status():
-    st = load_state()
+def get_status(session_id: str):
+    st = load_state(session_id)
     return {
+        "session_id": session_id,
         "is_running": st["is_running"],
         "progress": min(st["progress"], 100),
         "camera_progress": st["camera_progress"],
@@ -157,10 +170,9 @@ def get_status():
         "results_ready": st["results_ready"]
     }
 
-@app.get("/images/{image_name}")
-def get_image(image_name: str):
-    """Serves annotated images from the active inference staging directory."""
-    st = load_state()
+@app.get("/images/{session_id}/{image_name}")
+def get_image(session_id: str, image_name: str):
+    st = load_state(session_id)
     if not st.get("current_output_dir"):
         return Response(status_code=404)
     
@@ -170,8 +182,8 @@ def get_image(image_name: str):
     return Response(status_code=404)
 
 @app.get("/api/results")
-def get_results():
-    st = load_state()
+def get_results(session_id: str):
+    st = load_state(session_id)
     if not st["results_ready"] or not st["current_output_dir"]:
         return {"status": "not_ready"}
     try:
@@ -185,7 +197,7 @@ def get_results():
 
 @app.post("/api/delete_result")
 def delete_result(req: DeleteRequest):
-    st = load_state()
+    st = load_state(req.session_id)
     if not st["current_output_dir"]:
         return {"status": "error", "message": "No active directory"}
 
@@ -219,15 +231,13 @@ def delete_result(req: DeleteRequest):
 
 @app.post("/api/generate_final_export")
 def generate_final_export(req: FinalExportRequest):
-    st = load_state()
+    st = load_state(req.session_id)
     if not st["current_output_dir"]:
         return {"status": "error", "message": "No active directory"}
     
-    # Filter only verified and classified results
     final_data = [d for d in req.results if d.get('verified') and d.get('classification')]
     
     if not final_data:
-        # Still generate an empty dataframe for zip if requested, or return error. Returning error is safer to avoid creating malformed shapefiles.
         return {"status": "error", "message": "No verified detections to export."}
         
     df = pd.DataFrame(final_data)
@@ -238,20 +248,18 @@ def generate_final_export(req: FinalExportRequest):
     
     base_name = "tip_firida_bransament"
     
-    # Overwrite the output files with the final data
     json_path = os.path.join(st["current_output_dir"], f"{base_name}.json")
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(final_data, f)
         
     shp_path = os.path.join(st["current_output_dir"], f"{base_name}.shp")
-    # if it previously existed and we update, Geopandas handles overwriting cleanly mostly, but let's just use to_file
     gdf.to_file(shp_path)
     
     return {"status": "success"}
 
 @app.get("/api/download_shapefile")
-def download_shapefile():
-    st = load_state()
+def download_shapefile(session_id: str):
+    st = load_state(session_id)
     target_dir = st["current_output_dir"]
     base_name = "tip_firida_bransament"
     
@@ -259,7 +267,7 @@ def download_shapefile():
         return Response(content="Shapefile not generated yet", status_code=404)
         
     desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
-    final_output_dir = os.path.join(desktop_path, f"Gauss_Results_{int(time.time())}")
+    final_output_dir = os.path.join(desktop_path, f"Gauss_Results_{session_id}")
     os.makedirs(final_output_dir, exist_ok=True)
     
     zip_path = os.path.join(final_output_dir, f"{base_name}.zip")
@@ -271,7 +279,6 @@ def download_shapefile():
                 shutil.copy2(file_path, os.path.join(final_output_dir, f"{base_name}{ext}"))
                 zip_file.write(file_path, arcname=f"{base_name}{ext}")
                 
-    # --- FIXED: Added headers to force the browser to trigger a download window ---
     return FileResponse(
         path=zip_path, 
         filename=f"{base_name}.zip", 
@@ -280,13 +287,12 @@ def download_shapefile():
     )
 
 @app.post("/api/cancel")
-def cancel_analysis():
-    st = load_state()
+def cancel_analysis(session_id: str = Query(...)):
+    st = load_state(session_id)
     pid = st.get("process_id")
     
     if pid:
         try:
-            # Terminate the background process across workers
             os.kill(pid, signal.SIGTERM) 
         except Exception:
             pass
@@ -295,5 +301,5 @@ def cancel_analysis():
     st["camera_progress"] = {"Camera1": 0, "Camera2": 0, "Camera3": 0, "Camera4": 0}
     st["logs"].append("ERROR: Analysis cancelled by user.")
     st["process_id"] = None
-    save_state(st)
+    save_state(session_id, st)
     return {"status": "cancelled"}

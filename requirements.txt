@@ -9,3 +9,6 @@ geopandas
 shapely
 openpyxl
 tqdm
+laspy
+scipy
+pyproj
