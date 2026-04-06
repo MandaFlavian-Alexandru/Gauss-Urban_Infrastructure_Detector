@@ -125,23 +125,20 @@ def calculate_gps_offset_3d(origin_x, origin_y, origin_z, car_heading, bbox_cent
     
     # Raycast Search Sequence
     if kdtree is not None and points is not None:
-        intersected_indices = set()
-        # Walk along the ray from 2m to 25m out in 1m steps
-        for d in np.arange(2.0, 25.0, 1.0):
+        # Finer ray step resolution for exact surface impact
+        for d in np.arange(2.0, 25.0, 0.5):
             pt = [origin_x + dir_e * d, origin_y + dir_n * d, origin_z + dir_z * d]
-            # Search a 1.5m radius cylinder volume
-            idxs = kdtree.query_ball_point(pt, r=1.5)
-            intersected_indices.update(idxs)
+            # Narrower search radius prevents grabbing foreground tree leaves
+            idxs = kdtree.query_ball_point(pt, r=0.6)
             
-            # If we hit a dense solid face, stop ray before it punches through a wall
-            if len(idxs) > 15:
+            # Strike detection: Require at least 5 points to consider it a solid object/wall
+            if len(idxs) >= 5:
+                cluster = points[idxs]
+                # We calculate the centroid ONLY on this specific concentrated strike plate
+                centroid_x = float(np.mean(cluster[:, 0]))
+                centroid_y = float(np.mean(cluster[:, 1]))
                 break
                 
-        if len(intersected_indices) > 0:
-            cluster = points[list(intersected_indices)]
-            centroid_x = float(np.mean(cluster[:, 0]))
-            centroid_y = float(np.mean(cluster[:, 1]))
-            
     # Fallback to 2D planar math if LiDAR isn't available or ray hit empty air
     if centroid_x is None:
         t = CAMERA_HEIGHT / ray_y
