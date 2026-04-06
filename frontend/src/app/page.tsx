@@ -107,20 +107,20 @@ export default function Home() {
       const s = Math.floor((durationMs % 60000) / 1000);
       const formattedDuration = `${m}m ${s}s`;
 
-      setSessions(current => current.map(cs => {
-        if (cs.id !== sessionId) return cs;
-        return {
-          ...cs,
-          processDuration: formattedDuration,
-          resultsData: Array.isArray(finalResults) ? finalResults : [],
-          trashBin: []
-        };
-      }));
-
       if (!Array.isArray(finalResults) || finalResults.length === 0) {
-        setTimeout(() => {
-            alert(`Analysis for ${sessionId} completed but no Firidas were detected.`);
-        }, 500);
+        // Automatically hide sessions with 0 results silently
+        setSessions(current => current.filter(cs => cs.id !== sessionId));
+        if (activeSessionId === sessionId) setActiveSessionId(null);
+      } else {
+        setSessions(current => current.map(cs => {
+          if (cs.id !== sessionId) return cs;
+          return {
+            ...cs,
+            processDuration: formattedDuration,
+            resultsData: finalResults,
+            trashBin: []
+          };
+        }));
       }
     } catch (e) {
        console.error("Error fetching final results", e);

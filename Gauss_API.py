@@ -152,31 +152,44 @@ def run_subprocess(session_id: str, folder_path: str, las_folder_path: str, conf
 @app.post("/api/analyze")
 def start_analysis(req: AnalysisRequest):
     if not os.path.exists(req.folder_path) or not os.path.isdir(req.folder_path):
-        return {"status": "error", "message": "Master Directory path is invalid or cannot be reached."}
+        return {"status": "error", "message": "Directory path is invalid or cannot be reached."}
 
     recording_dirs = []
     try:
-        sub_dirs = os.listdir(req.folder_path)
-        for subd in sub_dirs:
-            full_path = os.path.join(req.folder_path, subd)
-            if os.path.isdir(full_path):
-                # Verify if it contains valid Camera subdirectories
-                has_cameras = False
-                for inner_d in os.listdir(full_path):
-                    if "Camera" in inner_d and os.path.isdir(os.path.join(full_path, inner_d)):
-                        has_cameras = True
-                        break
+        # 1. Check if the directory itself is a Recording folder
+        is_direct_recording = False
+        for item in os.listdir(req.folder_path):
+            if "Camera" in item and os.path.isdir(os.path.join(req.folder_path, item)):
+                is_direct_recording = True
+                break
                 
-                if has_cameras:
-                    recording_dirs.append({
-                        "name": subd,
-                        "path": full_path
-                    })
+        if is_direct_recording:
+            recording_dirs.append({
+                "name": os.path.basename(os.path.normpath(req.folder_path)),
+                "path": req.folder_path
+            })
+        else:
+            # 2. Iterate as a Master Directory
+            sub_dirs = os.listdir(req.folder_path)
+            for subd in sub_dirs:
+                full_path = os.path.join(req.folder_path, subd)
+                if os.path.isdir(full_path):
+                    has_cameras = False
+                    for inner_d in os.listdir(full_path):
+                        if "Camera" in inner_d and os.path.isdir(os.path.join(full_path, inner_d)):
+                            has_cameras = True
+                            break
+                    
+                    if has_cameras:
+                        recording_dirs.append({
+                            "name": subd,
+                            "path": full_path
+                        })
     except Exception as e:
         return {"status": "error", "message": f"Error scanning directory: {str(e)}"}
 
     if not recording_dirs:
-         return {"status": "error", "message": "No valid recording directories containing 'CameraX' folders were found inside the Master Directory."}
+         return {"status": "error", "message": "No valid recording directories containing 'CameraX' folders were found."}
 
     sessions_started = []
     
