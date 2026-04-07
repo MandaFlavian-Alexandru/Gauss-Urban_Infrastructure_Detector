@@ -147,7 +147,7 @@ def _unproject_pixel(
     dx = u - cx
     dy = v - cy
 
-    if cfg.fisheye_a0 is not None:
+    if cfg.fisheye_a0 is not None and cfg.fisheye_a2 is not None and cfg.fisheye_a4 is not None:
         # --- Scaramuzza polynomial model ---
         r_pix = math.sqrt(dx ** 2 + dy ** 2)
         if r_pix < 1e-6:
@@ -460,7 +460,7 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                 current_mount_angle = angle
                 break
 
-        if not current_cam_key:
+        if not current_cam_key or current_mount_angle is None:
             continue
 
         print(f"\n---> Initializing {current_cam_key} (mount {current_mount_angle}°)")
@@ -495,7 +495,7 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
         df_coords["Imagine"] = df_coords["Imagine"].astype(str).str.strip().str.lower()
 
         # Build a lookup dict for O(1) image → row access
-        coord_lookup: dict[str, dict] = {
+        coord_lookup = {
             row["Imagine"]: row for _, row in df_coords.iterrows()
         }
 
@@ -655,11 +655,9 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
     # Secondary mutual proximity flag
     for i, f1 in enumerate(unique_firidas):
         for j, f2 in enumerate(unique_firidas):
-            if i != j:
-                if haversine_distance(f1["lat"], f1["lon"], f2["lat"], f2["lon"]) \
-                        <= cfg.cluster_radius_m:
-                    f1["clustered"] = True
-                    f2["clustered"] = True
+            if i != j and haversine_distance(f1["lat"], f1["lon"], f2["lat"], f2["lon"]) <= cfg.cluster_radius_m:
+                f1["clustered"] = True
+                f2["clustered"] = True
 
     print(f"Spatial filtering complete — {len(unique_firidas)} unique instances.")
 

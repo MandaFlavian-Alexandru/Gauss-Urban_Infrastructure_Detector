@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import contextlib
 import logging
 import subprocess
 import threading
@@ -110,41 +111,43 @@ def run_subprocess(session_id: str, folder_path: str, las_folder_path: str, conf
         "--output", output_dir 
     ]
     
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=False)
     st["process_id"] = process.pid
     save_state(session_id, st)
     
-    for line in iter(process.stdout.readline, ''):
-        line = line.strip()
-        if line:
-            st = load_state(session_id) # Refresh state before updating
-            
-            # Clean ANSI characters that tqdm outputs for a cleaner UI log
-            clean_log = re.sub(r'(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]', '', line)
-            
-            # Tqdm naturally emits percentage blocks, so we skip adding pure percentage strings to logs
-            if not '%' in clean_log or "[PHASE" in clean_log:
-                 st["logs"].append(clean_log)
-                 if len(st["logs"]) > 50: 
-                     st["logs"] = st["logs"][-50:]
+    if process.stdout:
+        for line in iter(process.stdout.readline, ''):
+            if line := line.strip():
+                st = load_state(session_id) # Refresh state before updating
                 
-            # Regex for literal `Scanning Camera1:  63%|` outputs
-            cam_m = re.search(r'Scanning.*?(Camera[1-4]).*?(\d+)\s*%', clean_log)
-            if cam_m:
-                st["camera_progress"][cam_m.group(1)] = int(cam_m.group(2))
+                # Clean ANSI characters that tqdm outputs for a cleaner UI log
+                clean_log = re.sub(r'(\x9B|\x1B\[)[0-?]*[ -\/]*[@-~]', '', line)
                 
-            if "[PHASE 1]" in clean_log: st["progress"] = 5
-            elif "[PHASE 3]" in clean_log: st["progress"] = 75
-            elif "[PHASE 4]" in clean_log: st["progress"] = 90
-            
-            # Dynamically calc phase 2 progress using tqdm stats
-            if st["progress"] < 75:
-                # Up to 400 cumulative points total across 4 cameras
-                cam_total = sum(st["camera_progress"].values())
-                cam_overall = cam_total / 400.0
-                st["progress"] = 5 + int(cam_overall * 70)
+                # Tqdm naturally emits percentage blocks, so we skip adding pure percentage strings to logs
+                if '%' not in clean_log or "[PHASE" in clean_log:
+                     st["logs"].append(clean_log)
+                     if len(st["logs"]) > 50: 
+                         st["logs"] = st["logs"][-50:]
+                    
+                # Regex for literal `Scanning Camera1:  63%|` outputs
+                if cam_m := re.search(r'Scanning.*?(Camera[1-4]).*?(\d+)\s*%', clean_log):
+                    st["camera_progress"][cam_m[1]] = int(cam_m[2])
+                    
+                if "[PHASE 1]" in clean_log:
+                    st["progress"] = 5
+                elif "[PHASE 3]" in clean_log:
+                    st["progress"] = 75
+                elif "[PHASE 4]" in clean_log:
+                    st["progress"] = 90
+                
+                # Dynamically calc phase 2 progress using tqdm stats
+                if st["progress"] < 75:
+                    # Up to 400 cumulative points total across 4 cameras
+                    cam_total = sum(st["camera_progress"].values())
+                    cam_overall = cam_total / 400.0
+                    st["progress"] = 5 + int(cam_overall * 70)
 
-            save_state(session_id, st)
+                save_state(session_id, st)
             
     if process.stdout:
         process.stdout.close()
@@ -181,11 +184,7 @@ def start_analysis(req: AnalysisRequest):
     recording_dirs = []
     try:
         # 1. Check if the directory itself is a Recording folder
-        is_direct_recording = False
-        for item in os.listdir(req.folder_path):
-            if "Camera" in item and os.path.isdir(os.path.join(req.folder_path, item)):
-                is_direct_recording = True
-                break
+        is_direct_recording = any("Camera" in item and os.path.isdir(os.path.join(req.folder_path, item)) for item in os.listdir(req.folder_path))
                 
         if is_direct_recording:
             recording_dirs.append({
@@ -198,11 +197,7 @@ def start_analysis(req: AnalysisRequest):
             for subd in sub_dirs:
                 full_path = os.path.join(req.folder_path, subd)
                 if os.path.isdir(full_path):
-                    has_cameras = False
-                    for inner_d in os.listdir(full_path):
-                        if "Camera" in inner_d and os.path.isdir(os.path.join(full_path, inner_d)):
-                            has_cameras = True
-                            break
+                    has_cameras = any("Camera" in inner_d and os.path.isdir(os.path.join(full_path, inner_d)) for inner_d in os.listdir(full_path))
                     
                     if has_cameras:
                         recording_dirs.append({
@@ -321,9 +316,10 @@ def generate_final_export(req: FinalExportRequest):
     if not final_data:
         return {"status": "error", "message": "No verified detections to export."}
         
+    import pathlib
     df = pd.DataFrame(final_data)
     df.rename(columns={'classification': 'Tip Firida'}, inplace=True)
-    geometry = [Point(xy) for xy in zip(df['lon'], df['lat'])]
+    geometry = gpd.points_from_xy(df['lon'], df['lat'])
     gdf = gpd.GeoDataFrame(df, geometry=geometry)
     gdf.set_crs(epsg=4326, inplace=True)
     
@@ -334,7 +330,7 @@ def generate_final_export(req: FinalExportRequest):
         json.dump(final_data, f)
         
     shp_path = os.path.join(st["current_output_dir"], f"{base_name}.shp")
-    gdf.to_file(shp_path)
+    gdf.to_file(pathlib.Path(shp_path))
     
     return {"status": "success"}
 
@@ -370,13 +366,10 @@ def download_shapefile(session_id: str):
 @app.post("/api/cancel")
 def cancel_analysis(session_id: str = Query(...)):
     st = load_state(session_id)
-    pid = st.get("process_id")
     
-    if pid:
-        try:
-            os.kill(pid, signal.SIGTERM) 
-        except Exception:
-            pass
+    if pid := st.get("process_id"):
+        with contextlib.suppress(Exception):
+            os.kill(pid, signal.SIGTERM)
             
     st["is_running"] = False
     st["is_pending"] = False
