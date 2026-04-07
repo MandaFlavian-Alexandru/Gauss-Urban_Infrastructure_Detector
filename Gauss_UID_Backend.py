@@ -635,15 +635,21 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                 uf["seen_count"] = uf.get("seen_count", 1) + 1
                 uf["clustered"]  = True
 
+                if "cluster_members" not in uf:
+                    uf["cluster_members"] = [dict(uf)]
+                uf["cluster_members"].append(dict(det))
+
                 if det["conf"] > uf["conf"]:
                     det["clustered"]  = True
                     det["seen_count"] = uf["seen_count"]
+                    det["cluster_members"] = uf["cluster_members"]
                     uf.update(det)
                 break
 
         if not matched:
             det["clustered"]  = False
             det["seen_count"] = 1
+            det["cluster_members"] = [dict(det)]
             unique_firidas.append(det)
 
     # Secondary mutual proximity flag
@@ -680,16 +686,40 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
         if f["px_edge_flag"]:
             label += " [EDGE]"
 
-        img_path = os.path.join(f["folder_path"], f["image"])
-        img      = cv2.imread(img_path)
-        if img is not None:
-            cv2.rectangle(img, (f["x1"], f["y1"]), (f["x2"], f["y2"]), color, 4)
-            cv2.putText(
-                img, label, (f["x1"], f["y1"] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2,
-            )
+        members = f.get("cluster_members", [f])
+        images_to_stitch = []
+
+        for member in members:
+            img_path = os.path.join(member["folder_path"], member["image"])
+            img = cv2.imread(img_path)
+            if img is not None:
+                cv2.rectangle(img, (member["x1"], member["y1"]), (member["x2"], member["y2"]), color, 4)
+                
+                # Context prefix
+                member_label = f"{member['cam_key']} - {label}"
+                
+                cv2.putText(
+                    img, member_label, (member["x1"], member["y1"] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2,
+                )
+                images_to_stitch.append(img)
+
+        if images_to_stitch:
+            # Resize images to match the height of the first one for nice horizontal stitching
+            target_h = images_to_stitch[0].shape[0]
+            resized_images = []
+            for im in images_to_stitch:
+                h, w = im.shape[:2]
+                if h != target_h:
+                    aspect_ratio = w / h
+                    new_w = int(target_h * aspect_ratio)
+                    im = cv2.resize(im, (new_w, target_h))
+                resized_images.append(im)
+                
+            final_img = cv2.hconcat(resized_images)
+            
             cv2.imwrite(
-                os.path.join(cfg.output_folder, f"{f['cam_key']}_{f['image']}"), img
+                os.path.join(cfg.output_folder, f"{f['cam_key']}_{f['image']}"), final_img
             )
 
     # ------------------------------------------------------------------
