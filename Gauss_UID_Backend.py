@@ -687,7 +687,6 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
             label += " [EDGE]"
 
         members = f.get("cluster_members", [f])
-        images_to_stitch = []
 
         for member in members:
             img_path = os.path.join(member["folder_path"], member["image"])
@@ -702,33 +701,28 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                     img, member_label, (member["x1"], member["y1"] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2,
                 )
-                images_to_stitch.append(img)
-
-        if images_to_stitch:
-            # Resize images to match the height of the first one for nice horizontal stitching
-            target_h = images_to_stitch[0].shape[0]
-            resized_images = []
-            for im in images_to_stitch:
-                h, w = im.shape[:2]
-                if h != target_h:
-                    aspect_ratio = w / h
-                    new_w = int(target_h * aspect_ratio)
-                    im = cv2.resize(im, (new_w, target_h))
-                resized_images.append(im)
-                
-            final_img = cv2.hconcat(resized_images)
-            
-            cv2.imwrite(
-                os.path.join(cfg.output_folder, f"{f['cam_key']}_{f['image']}"), final_img
-            )
+                cv2.imwrite(
+                    os.path.join(cfg.output_folder, f"{member['cam_key']}_{member['image']}"), img
+                )
 
     # ------------------------------------------------------------------
     # PHASE 4 — QGIS deliverables
     # ------------------------------------------------------------------
     print("[PHASE 4] Compiling QGIS deliverables...")
 
+    flattened_firidas = []
     if unique_firidas:
-        df_export = pd.DataFrame(unique_firidas)
+        for f in unique_firidas:
+            members = f.get("cluster_members", [f])
+            for m in members:
+                m_copy = dict(m)
+                m_copy["clustered"] = f.get("clustered", False)
+                if "cluster_members" in m_copy:
+                    del m_copy["cluster_members"]
+                flattened_firidas.append(m_copy)
+
+    if flattened_firidas:
+        df_export = pd.DataFrame(flattened_firidas)
 
         # Strip internal / geometry columns before writing
         drop_cols = [c for c in ["x1", "y1", "x2", "y2", "folder_path",
