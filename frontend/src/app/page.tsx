@@ -57,6 +57,9 @@ export default function Home() {
   // Lightbox State
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
   const [zoomLevel, setZoomLevel] = useState<number>(1);
+  const [zoomOrigin, setZoomOrigin] = useState({ x: 50, y: 50 });
+  const modalWrapperRef = useRef<HTMLDivElement>(null);
+  const zoomImageRef = useRef<HTMLDivElement>(null);
 
   const activeSession = sessions.find(s => s.id === activeSessionId) || null;
   const currentImageArray = activeSession ? (dashboardViewMode === 'active' ? activeSession.resultsData : activeSession.trashBin) : [];
@@ -255,29 +258,61 @@ export default function Home() {
   };
 
   // Lightbox Handlers
-  const handleOpenLightbox = (index: number) => { setSelectedIndex(index); setZoomLevel(1); };
-  const handleCloseLightbox = () => { setSelectedIndex(null); setZoomLevel(1); };
+  const handleOpenLightbox = (index: number) => { setSelectedIndex(index); setZoomLevel(1); setZoomOrigin({ x: 50, y: 50 }); };
+  const handleCloseLightbox = () => { setSelectedIndex(null); setZoomLevel(1); setZoomOrigin({ x: 50, y: 50 }); };
   const handlePrevImage = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (currentImageArray.length === 0) return;
     setSelectedIndex(prev => (prev !== null && prev > 0) ? prev - 1 : currentImageArray.length - 1);
     setZoomLevel(1);
+    setZoomOrigin({ x: 50, y: 50 });
   };
   const handleNextImage = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (currentImageArray.length === 0) return;
     setSelectedIndex(prev => (prev !== null && prev < currentImageArray.length - 1) ? prev + 1 : 0);
     setZoomLevel(1);
+    setZoomOrigin({ x: 50, y: 50 });
   };
   const handleZoomIn = (e: React.MouseEvent) => { e.stopPropagation(); setZoomLevel(prev => Math.min(prev + 0.5, 4)); };
   const handleZoomOut = (e: React.MouseEvent | KeyboardEvent) => {
     if ('stopPropagation' in e) e.stopPropagation();
     setZoomLevel(prev => Math.max(prev - 0.5, 0.5));
   };
-  const handleWheel = (e: React.WheelEvent) => {
-    if (e.deltaY < 0) { setZoomLevel(prev => Math.min(prev + 0.2, 5)); } 
-    else { setZoomLevel(prev => Math.max(prev - 0.2, 0.5)); }
-  };
+
+  useEffect(() => {
+    if (selectedIndex !== null) {
+      document.body.style.overflow = 'hidden';
+    } else {
+      document.body.style.overflow = 'unset';
+    }
+    return () => { document.body.style.overflow = 'unset'; };
+  }, [selectedIndex]);
+
+  useEffect(() => {
+    const wrapper = modalWrapperRef.current;
+    if (!wrapper) return;
+
+    const handleNativeWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      
+      if (zoomImageRef.current) {
+        const rect = zoomImageRef.current.getBoundingClientRect();
+        const x = ((e.clientX - rect.left) / rect.width) * 100;
+        const y = ((e.clientY - rect.top) / rect.height) * 100;
+        setZoomOrigin({ x, y });
+      }
+
+      if (e.deltaY < 0) {
+        setZoomLevel(prev => Math.min(prev + 0.2, 5));
+      } else {
+        setZoomLevel(prev => Math.max(prev - 0.2, 0.5));
+      }
+    };
+
+    wrapper.addEventListener('wheel', handleNativeWheel, { passive: false });
+    return () => wrapper.removeEventListener('wheel', handleNativeWheel);
+  }, [selectedIndex]);
 
   const handleToggleVerify = useCallback(() => {
     if (selectedIndex === null || !activeSessionId || dashboardViewMode === 'trash') return;
@@ -322,6 +357,7 @@ export default function Home() {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "ArrowRight") handleNextImage(e as any);
       else if (e.key === "ArrowLeft") handlePrevImage(e as any);
+      else if (e.key === "Escape") handleCloseLightbox();
       else if (e.key === " " && dashboardViewMode === 'active') { e.preventDefault(); handleToggleVerify(); }
       else if (e.key.toLowerCase() === "x") { e.preventDefault(); handleDeleteCurrent(); }
       else if (['1', '2', '3', '4'].includes(e.key) && dashboardViewMode === 'active') { e.preventDefault(); handleClassify(parseInt(e.key)); }
@@ -673,8 +709,8 @@ export default function Home() {
             </button>
           </div>
 
-          <div className="w-full h-full flex flex-col items-center justify-center overflow-auto custom-scrollbar" onClick={(e) => e.stopPropagation()} onWheel={handleWheel}>
-            <div className={`relative transition-transform duration-200 ease-out flex-shrink-0 ${dashboardViewMode === 'trash' ? 'grayscale' : ''}`} style={{ transform: `scale(${zoomLevel})` }}>
+          <div ref={modalWrapperRef} className="w-full h-full flex flex-col items-center justify-center overflow-auto custom-scrollbar" onClick={(e) => e.stopPropagation()}>
+            <div ref={zoomImageRef} className={`relative transition-transform duration-200 ease-out flex-shrink-0 ${dashboardViewMode === 'trash' ? 'grayscale' : ''}`} style={{ transform: `scale(${zoomLevel})`, transformOrigin: `${zoomOrigin.x}% ${zoomOrigin.y}%` }}>
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img 
                 src={`http://localhost:8000/images/${activeSessionId}/${currentImageArray[selectedIndex].cam_key}_${currentImageArray[selectedIndex].image}`} 
