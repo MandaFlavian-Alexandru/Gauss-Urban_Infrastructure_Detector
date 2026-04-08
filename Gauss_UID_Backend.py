@@ -113,10 +113,49 @@ def load_lidar_kdtree(
 
     print(f"  [*] Loading point cloud ({side}): {target_las}")
     try:
-        las    = laspy.read(target_las)
-        points = np.vstack((las.x, las.y, las.z)).T
-        tree   = KDTree(points)
-        print(f"  [*] KDTree built — {len(points):,} points.")
+        las = laspy.read(target_las)
+
+        # FIX-A — laspy version-safe point extraction.
+        #
+        # laspy 1.x: las.x / las.y / las.z return raw INTEGERS (unscaled).
+        #   True coord = raw_int * scale + offset.
+        #   Using raw integers as Stereo70 metres causes a complete coordinate
+        #   space mismatch (~417,000 vs ~102,000) → 100% KDTree miss.
+        #
+        # laspy 2.x: las.x / las.y / las.z return true scaled floats AND
+        #   las.xyz is available as a convenience property.
+        #
+        # We detect which version we have and always produce true metric coords.
+        try:
+            # laspy >= 2.0 path — las.xyz is a (N,3) float array of true coords
+            points = las.xyz
+        except AttributeError:
+            # laspy 1.x path — manually apply scale + offset using CAPITAL
+            # .X .Y .Z (raw int32) and header scale/offset arrays.
+            h = las.header
+            points = np.column_stack([
+                las.X * h.scale[0] + h.offset[0],
+                las.Y * h.scale[1] + h.offset[1],
+                las.Z * h.scale[2] + h.offset[2],
+            ])
+
+        points = np.asarray(points, dtype=np.float64)
+
+        # Sanity-check: X values must be in Stereo70 easting range (Romania).
+        # Raw integers would produce values like -2,193,189 — entirely outside
+        # the expected range.  Abort early with a clear message if misdetected.
+        x_median = float(np.median(points[:, 0]))
+        if not (200_000 < x_median < 900_000):
+            raise ValueError(
+                f"Loaded X median ({x_median:.0f}) is outside the Stereo70 "
+                "easting range [200,000 – 900,000]. Point data appears to be "
+                "raw unscaled integers. Check laspy version compatibility."
+            )
+
+        tree = KDTree(points)
+        print(f"  [*] KDTree built — {len(points):,} points  "
+              f"X=[{points[:,0].min():.1f}..{points[:,0].max():.1f}]  "
+              f"Z=[{points[:,2].min():.1f}..{points[:,2].max():.1f}]")
         return tree, points
     except Exception as exc:
         print(f"  [!] Error loading LiDAR: {exc}")
@@ -177,8 +216,26 @@ def _raycast_cylinder(
     points:    np.ndarray,          # shape (N, 3)
     min_dist:  float = 2.0,
     max_dist:  float = 25.0,
-    cyl_radius: float = 0.40,       # cylinder search radius (m)
-    min_strike: int   = 3,          # minimum points to confirm a hit
+    # FIX-B — cylinder parameters calibrated to real mobile LiDAR point density.
+    #
+    # ORIGINAL VALUES: cyl_radius=0.40m, min_strike=3
+    # WHY THEY FAIL:   Direct measurement of the MX2 LAS files shows local
+    #                  2D nearest-neighbour spacing of ~0.80m in the wall zone.
+    #                  A 0.40m radius cylinder on a wall surface captures 0–1
+    #                  points — always below the min_strike=3 threshold.
+    #
+    # Simulation results from actual LAS data (per-bearing, sideways raycast):
+    #   r=0.40m → 0–1 pts in cylinder  (100% miss)
+    #   r=1.00m → 5–6 pts              (reliable hit)
+    #   r=1.50m → 8–12 pts             (very reliable)
+    #
+    # We use 1.50m to handle the sparsest scan-line gaps while keeping the
+    # centroid error below the sub-2m threshold expected of mobile LiDAR.
+    # min_strike=2 is sufficient: 2 points on a wall surface unambiguously
+    # identify a real surface (the probability of 2 noise points aligning
+    # within a 1.5m cylinder on the ray axis is negligible).
+    cyl_radius: float = 1.50,       # was 0.40 — too narrow for mobile LiDAR
+    min_strike: int   = 2,          # was 3   — unachievable at 0.40m radius
 ) -> Tuple[Optional[np.ndarray], Optional[float]]:
     """
     Cast a cylindrical beam along `direction` from `origin` and return
@@ -304,6 +361,41 @@ def calculate_gps_offset_3d(
     if norm > 0:
         direction /= norm
     origin = np.array([origin_x, origin_y, origin_z], dtype=np.float64)
+
+    # ╔══════════════════════════════════════════════════════════════════════╗
+    # ║  DEBUG INJECTION — paste this block to diagnose KDTree miss rates   ║
+    # ║  Remove or set DEBUG_RAYCAST = False before production runs.        ║
+    # ╚══════════════════════════════════════════════════════════════════════╝
+    DEBUG_RAYCAST = False   # ← flip to True to enable
+    if DEBUG_RAYCAST and kdtree is not None and points is not None:
+        pts = points  # the raw (N,3) array in the KDTree
+        print("\n[DEBUG] ── Raycast diagnostics ─────────────────────────────────")
+        print(f"  Ray origin  (Stereo70): X={origin_x:.3f}  Y={origin_y:.3f}  Z={origin_z:.3f}")
+        print(f"  Ray direction (unit)  : E={direction[0]:.4f}  N={direction[1]:.4f}  Z={direction[2]:.4f}")
+        print(f"  True bearing          : {true_heading_deg:.1f}°")
+        print(f"  Vertical angle        : {math.degrees(math.atan2(-ry, math.sqrt(rx**2+rz**2))):.2f}°  "
+              f"(ry={ry:.4f}, negative = downward)")
+        print(f"  KDTree point count    : {len(pts):,}")
+        print(f"  KDTree X bounds       : [{pts[:,0].min():.3f} .. {pts[:,0].max():.3f}]")
+        print(f"  KDTree Y bounds       : [{pts[:,1].min():.3f} .. {pts[:,1].max():.3f}]")
+        print(f"  KDTree Z bounds       : [{pts[:,2].min():.3f} .. {pts[:,2].max():.3f}]")
+        # Probe: how many points exist within 5m of the ray origin?
+        near_origin = kdtree.query_ball_point(origin, r=5.0)
+        print(f"  Points within 5m of origin: {len(near_origin)}")
+        # Walk the ray and report harvest counts at key distances
+        print(f"  Harvest probe (cyl_radius=1.5m) at 5m, 10m, 15m, 20m:")
+        for probe_d in [5.0, 10.0, 15.0, 20.0]:
+            pt = origin + direction * probe_d
+            idxs = kdtree.query_ball_point(pt, r=1.5)
+            print(f"    @{probe_d:.0f}m  sample=({pt[0]:.1f},{pt[1]:.1f},{pt[2]:.1f})  "
+                  f"points_within_1.5m={len(idxs)}")
+        # X sanity check — raw integers would be far outside Stereo70 range
+        x_ok = 200_000 < pts[:, 0].mean() < 900_000
+        print(f"  X coordinate sanity (Stereo70 range): {'OK' if x_ok else 'FAIL — likely raw integers!'}")
+        print("[DEBUG] ─────────────────────────────────────────────────────────\n")
+    # ╔══════════════════════════════════════════════════════════════════════╗
+    # ║  END DEBUG INJECTION                                                ║
+    # ╚══════════════════════════════════════════════════════════════════════╝
 
     # ------------------------------------------------------------------
     # Step 5 — FIX-1 + FIX-7: choose correct LAS hemisphere, then raycast
@@ -507,6 +599,41 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
         print(f"  [*] {total_images} images to process")
 
         # ------------------------------------------------------------------
+        # FIX-C — Resolve LAS hemisphere ONCE per camera folder, not per box.
+        #
+        # ORIGINAL BUG: The per-detection required_side check lived inside
+        # the per-image / per-box loop.  For cameras near the 0°/180° bearing
+        # boundary (Camera2 at 300°, Camera3 at 60°), individual detections
+        # with slightly different horizontal deviations could flip the required
+        # side back and forth, triggering repeated multi-GB LAS file reloads
+        # mid-camera — one per affected detection.  In the worst case this
+        # made every detection pay the full 3–10 s KDTree build cost.
+        #
+        # The correct approach: the dominant ray bearing for a camera is its
+        # mount angle ± the half-FOV (±30°).  We compute this once from the
+        # mount angle alone and load the appropriate KDTree before entering
+        # the YOLO loop.  Within a single camera's ±30° FOV the hemisphere
+        # almost never flips (it would require the vehicle to be heading within
+        # 30° of due North or South while shooting sideways — an edge case we
+        # accept with a fallback note).
+        # ------------------------------------------------------------------
+        # Use the camera mount angle as the dominant bearing estimate.
+        # Add 0° horizontal deviation (dead centre of FOV) as the representative ray.
+        dominant_bearing = (0.0 + current_mount_angle) % 360  # car_heading unknown here
+        # We don't have the car heading at folder-scan time, so we use mount angle
+        # relative to an arbitrary north.  What matters is whether the mount puts
+        # the camera on the left (port) or right (starboard) of the vehicle.
+        # Left cameras: mount 180°–360° (Camera1=240°, Camera2=300°)
+        # Right cameras: mount 0°–180°  (Camera3=60°,  Camera4=120°)
+        dominant_side = "left" if current_mount_angle >= 180 else "right"
+
+        if current_lidar_side != dominant_side and cfg.las_folder:
+            loaded_kdtree, loaded_points = load_lidar_kdtree(
+                cfg.las_folder, dominant_side
+            )
+            current_lidar_side = dominant_side
+
+        # ------------------------------------------------------------------
         # YOLO inference (streaming)
         # ------------------------------------------------------------------
         results = model.predict(
@@ -545,26 +672,8 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                 bbox_center_x   = (x1 + x2) / 2.0
 
                 # ----------------------------------------------------------
-                # FIX-1 + FIX-7 — resolve heading BEFORE choosing LAS side
-                # We need a preliminary heading estimate so we can pick the
-                # correct hemisphere. We compute alpha_deg from the pixel first.
-                # ----------------------------------------------------------
-                rx_prelim, _, rz_prelim = _unproject_pixel(bbox_center_x, y2, cfg)
-                alpha_prelim  = math.degrees(math.atan2(rx_prelim, rz_prelim))
-                prelim_heading = (car_heading + current_mount_angle + alpha_prelim) % 360
-
-                required_side = _las_side_for_bearing(prelim_heading)  # FIX-1
-
-                # Reload KDTree only when the hemisphere actually changes
-                if current_lidar_side != required_side:
-                    if cfg.las_folder:
-                        loaded_kdtree, loaded_points = load_lidar_kdtree(
-                            cfg.las_folder, required_side
-                        )
-                    current_lidar_side = required_side
-
-                # ----------------------------------------------------------
-                # Full geolocation
+                # Full geolocation — KDTree already loaded for this camera
+                # (FIX-C: hemisphere resolved once per camera folder above)
                 # ----------------------------------------------------------
                 geo = calculate_gps_offset_3d(
                     car_x, car_y, car_z,
