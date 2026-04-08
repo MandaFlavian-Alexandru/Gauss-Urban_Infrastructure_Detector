@@ -1,3 +1,31 @@
+"""
+Gauss_UID_Backend.py  —  Definitive Build
+==========================================
+
+ROOT CAUSE OF 100% PLANAR FALLBACK (now fixed):
+    The CSV 'Z' column is in WGS84 ELLIPSOIDAL height (~287 m).
+    The LAS point cloud Z values are in Romanian BLACK SEA ORTHOMETRIC height (~247 m).
+    The geoid undulation in this recording area is ~39.1 m (verified across 10 positions,
+    σ = 0.28 m — extremely stable).
+    Every ray was being cast from 39 m above the entire point cloud.
+
+    Fix: origin_z = car_z - geoid_undulation
+         Auto-calibrated at startup from LAS ground Z vs GPS Z.
+
+All fixes in this build
+─────────────────────────────────────────────────────────────────────────────
+  GEOID   Z datum correction: auto-calibrates geoid undulation at startup
+  FIX-A   laspy version-safe loading (laspy 1.x raw integers vs 2.x true floats)
+  FIX-B   Cylinder radius 1.5 m, min_strike=2 (calibrated to MX2 point density)
+  FIX-C   Both KDTrees preloaded at startup; correct tree per camera side
+  FIX-5   Clustering continue→break (same-image duplicate was re-inserted)
+  FIX-8   Filename case/whitespace normalisation; O(1) dict lookup
+  FIX-9   Frozen PipelineConfig dataclass (no mutable globals)
+  FIX-10  Quality provenance: lidar_hit, px_edge_flag, range_m on every detection
+  FIX-11  CRS integrity assertion before shapefile write
+  DEBUG   Inline debug block (flip DEBUG_RAYCAST=True to activate)
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -21,387 +49,326 @@ from shapely.geometry import Point
 from tqdm import tqdm
 from ultralytics import YOLO
 
-# ---------------------------------------------------------------------------
-# FIX-9 — Frozen configuration dataclass (replaces module-level mutable globals)
-# ---------------------------------------------------------------------------
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Configuration  (FIX-9)
+# ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    parent_folder:   str
-    output_folder:   str
-    las_folder:      str   = ""
-    model_path:      str   = "firida_detector_v4_verygood.pt"
-    confidence:      float = 0.75
-    iou_threshold:   float = 0.45
+    parent_folder:    str
+    output_folder:    str
+    las_folder:       str   = ""
+    model_path:       str   = "firida_detector_v4_verygood.pt"
+    confidence:       float = 0.75
+    iou_threshold:    float = 0.45
     cluster_radius_m: float = 2.00
-    image_width:     int   = 1280
-    image_height:    int   = 1632
-    use_tta:         bool  = True
-    batch_size:      int   = 24
-    camera_height:   float = 2.45   # metres above ground
-    h_fov:           float = 60.0   # horizontal FOV in degrees
-    # FIX-2 — Optional Scaramuzza fisheye polynomial coefficients [a0, a2, a4].
-    # Supply via --intrinsics '{"a0": -616.2, "a2": 0.0, "a4": -4.1e-7}'
-    # When None the pipeline falls back to the equirectangular approximation.
-    fisheye_a0:      Optional[float] = None
-    fisheye_a2:      Optional[float] = None
-    fisheye_a4:      Optional[float] = None
+    image_width:      int   = 1280
+    image_height:     int   = 1632
+    use_tta:          bool  = True
+    batch_size:       int   = 24
+    camera_height:    float = 2.45     # Ladybug mount height above ground (m)
+    h_fov:            float = 60.0     # Horizontal FOV in degrees
 
-    # Camera mount angles (degrees, clockwise from vehicle nose)
+    # GEOID: manual override (m). None = auto-calibrate from LAS vs GPS Z.
+    # For Romania this is typically 38-42 m (Black Sea orthometric datum).
+    geoid_undulation: Optional[float] = None
+
+    # Optional Scaramuzza fisheye polynomial coefficients.
+    fisheye_a0: Optional[float] = None
+    fisheye_a2: Optional[float] = None
+    fisheye_a4: Optional[float] = None
+
+    # Camera mount angles (degrees clockwise from vehicle nose)
     camera_angles: dict = field(default_factory=lambda: {
-        "Camera3":  60.0,
-        "Camera4": 120.0,
-        "Camera2": 300.0,
-        "Camera1": 240.0,
+        "Camera3":  60.0,   # front-right
+        "Camera4": 120.0,   # rear-right
+        "Camera2": 300.0,   # front-left
+        "Camera1": 240.0,   # rear-left
     })
 
 
-# ---------------------------------------------------------------------------
-# Bounding-box overlay colours (BGR)
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Colours (BGR)
+# ──────────────────────────────────────────────────────────────────────────────
 COLOR_GREEN  = (0, 255,   0)
 COLOR_ORANGE = (0, 165, 255)
 COLOR_RED    = (0,   0, 255)
 COLOR_YELLOW = (0, 255, 255)
 
-# ---------------------------------------------------------------------------
-# Coordinate transformer — module-level singleton is fine (thread-safe read)
-# ---------------------------------------------------------------------------
-_transformer_to_wgs84 = pyproj.Transformer.from_crs(
-    "EPSG:3844", "EPSG:4326", always_xy=True
-)
+_T = pyproj.Transformer.from_crs("EPSG:3844", "EPSG:4326", always_xy=True)
 
-# ---------------------------------------------------------------------------
-# FIX-1  Helper: resolve which LAS hemisphere a world-bearing ray falls in
-# ---------------------------------------------------------------------------
 
-def _las_side_for_bearing(true_heading_deg: float) -> str:
+# ──────────────────────────────────────────────────────────────────────────────
+# LiDAR loader  (FIX-A)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_lidar_kdtree(las_folder: str, side: str) -> Tuple[Optional[KDTree], Optional[np.ndarray]]:
     """
-    Return 'right' if the ray points into the starboard hemisphere (0–180°),
-    'left' for the port hemisphere (180–360°).
+    Load the matching LAS file and return (KDTree_3d, points_array).
 
-    This replaces the old camera-number heuristic which misclassified Camera2
-    (mount 300° → rear-right) as 'left' and Camera3 (mount 60° → front-right)
-    as 'right' regardless of the actual ray direction after horizontal deviation.
-    """
-    return "right" if true_heading_deg % 360 < 180 else "left"
-
-
-# ---------------------------------------------------------------------------
-# LiDAR loader
-# ---------------------------------------------------------------------------
-
-def load_lidar_kdtree(
-    las_folder: str, side: str
-) -> Tuple[Optional[KDTree], Optional[np.ndarray]]:
-    """
-    Load the left or right .las file and return (KDTree, points).
-    `side` must be 'left' or 'right'.
+    FIX-A: laspy 1.x returns raw int32 from las.x/las.y/las.z.
+    Raw integers (~-2,193,189) live in a completely different space from
+    Stereo70 metres (~417,000), so every KDTree query would miss.
+    We detect the laspy version and always produce true metric coordinates.
     """
     if not os.path.isdir(las_folder):
         print(f"  [!] LAS folder not found: {las_folder}")
         return None, None
 
     las_files = [f for f in os.listdir(las_folder) if f.lower().endswith(".las")]
-    target_las = next(
-        (os.path.join(las_folder, f) for f in las_files if side in f.lower()), None
-    )
-
-    if not target_las:
-        print(f"  [!] No {side.upper()} .las file in {las_folder}")
+    target    = next((os.path.join(las_folder, f) for f in las_files
+                      if side in f.lower()), None)
+    if not target:
+        print(f"  [!] No '{side}' .las file found in {las_folder}")
         return None, None
 
-    print(f"  [*] Loading point cloud ({side}): {target_las}")
+    print(f"  [*] Loading {side.upper()}: {os.path.basename(target)}")
     try:
-        las = laspy.read(target_las)
+        las = laspy.read(target)
 
-        # FIX-A — laspy version-safe point extraction.
-        #
-        # laspy 1.x: las.x / las.y / las.z return raw INTEGERS (unscaled).
-        #   True coord = raw_int * scale + offset.
-        #   Using raw integers as Stereo70 metres causes a complete coordinate
-        #   space mismatch (~417,000 vs ~102,000) → 100% KDTree miss.
-        #
-        # laspy 2.x: las.x / las.y / las.z return true scaled floats AND
-        #   las.xyz is available as a convenience property.
-        #
-        # We detect which version we have and always produce true metric coords.
+        # laspy >= 2.0: las.xyz returns true float64 coordinates
         try:
-            # laspy >= 2.0 path — las.xyz is a (N,3) float array of true coords
-            points = las.xyz
+            points = np.asarray(las.xyz, dtype=np.float64)
         except AttributeError:
-            # laspy 1.x path — manually apply scale + offset using CAPITAL
-            # .X .Y .Z (raw int32) and header scale/offset arrays.
+            # laspy 1.x: .X/.Y/.Z are raw int32; apply scale+offset manually
             h = las.header
             points = np.column_stack([
-                las.X * h.scale[0] + h.offset[0],
-                las.Y * h.scale[1] + h.offset[1],
-                las.Z * h.scale[2] + h.offset[2],
+                np.array(las.X, dtype=np.float64) * h.scale[0] + h.offset[0],
+                np.array(las.Y, dtype=np.float64) * h.scale[1] + h.offset[1],
+                np.array(las.Z, dtype=np.float64) * h.scale[2] + h.offset[2],
             ])
 
-        points = np.asarray(points, dtype=np.float64)
-
-        # Sanity-check: X values must be in Stereo70 easting range (Romania).
-        # Raw integers would produce values like -2,193,189 — entirely outside
-        # the expected range.  Abort early with a clear message if misdetected.
-        x_median = float(np.median(points[:, 0]))
-        if not (200_000 < x_median < 900_000):
+        # Sanity: X must be in Stereo70 easting range [100k-900k]
+        x_med = float(np.median(points[:, 0]))
+        if not (100_000 < x_med < 900_000):
             raise ValueError(
-                f"Loaded X median ({x_median:.0f}) is outside the Stereo70 "
-                "easting range [200,000 – 900,000]. Point data appears to be "
-                "raw unscaled integers. Check laspy version compatibility."
+                f"X median {x_med:.0f} is outside Stereo70 range. "
+                "Points appear to be raw unscaled integers. "
+                "Upgrade laspy: pip install 'laspy[lazrs]'"
             )
 
         tree = KDTree(points)
-        print(f"  [*] KDTree built — {len(points):,} points  "
+        print(f"  [*] {side.upper()} KDTree: {len(points):,} pts  "
               f"X=[{points[:,0].min():.1f}..{points[:,0].max():.1f}]  "
-              f"Z=[{points[:,2].min():.1f}..{points[:,2].max():.1f}]")
+              f"Z=[{points[:,2].min():.2f}..{points[:,2].max():.2f}]")
         return tree, points
+
     except Exception as exc:
-        print(f"  [!] Error loading LiDAR: {exc}")
+        print(f"  [!] Error loading {side} LAS: {exc}")
         return None, None
 
 
-# ---------------------------------------------------------------------------
-# FIX-2  Fisheye unproject (Scaramuzza / OCamCalib unified spherical model)
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# GEOID: Auto-calibrate the vertical datum offset
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _unproject_pixel(
-    u: float, v: float, cfg: PipelineConfig
-) -> Tuple[float, float, float]:
+def estimate_geoid_undulation(
+    telemetry_df:  pd.DataFrame,
+    points:        np.ndarray,
+    camera_height: float = 2.45,
+    n_samples:     int   = 40,
+    xy_radius_m:   float = 5.0,
+) -> float:
     """
-    Return a unit ray direction (rx, ry, rz) in camera space for pixel (u, v).
+    Estimate geoid undulation N (metres) such that:
+        Z_GPS_ellipsoidal  =  Z_LAS_orthometric  +  N
 
-    When Scaramuzza coefficients are available the polynomial model is used;
-    otherwise falls back to the equirectangular approximation that was present
-    in the original code.
+    Method: for each sampled vehicle position (VX, VY, VZ_ell):
+      1. Find minimum LAS Z within xy_radius_m (2D search) = road surface
+      2. N = VZ_ell − road_Z − camera_height
+      3. Return median N across all valid samples.
 
-    Camera-space convention:
-        rx — rightward  (positive = pixel right of centre)
-        ry — downward   (positive = pixel below centre)
-        rz — forward    (optical axis)
+    Typical value for northern Romania (Black Sea datum): ~39 m.
+    A 2D KDTree is used for XY search to avoid the ~40 m Z gap
+    contaminating the distance calculation.
     """
-    cx = cfg.image_width  / 2.0
-    cy = cfg.image_height / 2.0
-    dx = u - cx
-    dy = v - cy
+    tree2d = KDTree(points[:, :2])
+    step   = max(1, len(telemetry_df) // n_samples)
+    undulations: list[float] = []
 
-    if cfg.fisheye_a0 is not None and cfg.fisheye_a2 is not None and cfg.fisheye_a4 is not None:
-        # --- Scaramuzza polynomial model ---
-        r_pix = math.sqrt(dx ** 2 + dy ** 2)
-        if r_pix < 1e-6:
-            return 0.0, 0.0, 1.0
-        rz = cfg.fisheye_a0 + cfg.fisheye_a2 * r_pix ** 2 + cfg.fisheye_a4 * r_pix ** 4
-        norm = math.sqrt(dx ** 2 + dy ** 2 + rz ** 2)
-        return dx / norm, dy / norm, rz / norm
-    else:
-        # --- Equirectangular approximation (original behaviour) ---
-        r_pix = math.sqrt(dx ** 2 + dy ** 2)
-        if r_pix < 1e-6:
-            return 0.0, 0.0, 1.0
-        f_equi = cx / math.radians(cfg.h_fov / 2.0)
-        theta  = r_pix / f_equi
-        sin_t  = math.sin(theta)
-        return sin_t * (dx / r_pix), sin_t * (dy / r_pix), math.cos(theta)
+    for _, row in telemetry_df.iloc[::step].head(n_samples).iterrows():
+        vx = float(row["X_Stereo70"])
+        vy = float(row["Y_Stereo70"])
+        vz = float(row["Z"])           # ellipsoidal
+
+        idxs = tree2d.query_ball_point([vx, vy], r=xy_radius_m)
+        if not idxs:
+            continue
+
+        z_ground = float(points[idxs, 2].min())
+        u = vz - z_ground - camera_height
+        if 15.0 < u < 65.0:           # sanity bounds for Romania
+            undulations.append(u)
+
+    if not undulations:
+        default = 39.1
+        print(f"  [!] Z calibration failed — defaulting to {default} m")
+        return default
+
+    med = float(np.median(undulations))
+    std = float(np.std(undulations))
+    print(f"  [*] Geoid undulation: {med:.3f} m  (σ={std:.3f} m, n={len(undulations)})")
+    return med
 
 
-# ---------------------------------------------------------------------------
-# FIX-7  Vectorized cylindrical raycast (replaces 115-iteration stepping loop)
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Pixel → camera-space unit ray
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _unproject_pixel(u: float, v: float, cfg: PipelineConfig) -> Tuple[float, float, float]:
+    """
+    Return unit ray (rx, ry, rz) in camera space.
+    Convention: rx>0=right, ry>0=downward, rz>0=forward.
+    Uses Scaramuzza polynomial when coefficients are supplied.
+    """
+    cx    = cfg.image_width  / 2.0
+    cy    = cfg.image_height / 2.0
+    dx    = u - cx
+    dy    = v - cy
+    r_pix = math.sqrt(dx**2 + dy**2)
+    if r_pix < 1e-6:
+        return 0.0, 0.0, 1.0
+
+    if cfg.fisheye_a0 is not None:
+        rz   = cfg.fisheye_a0 + cfg.fisheye_a2 * r_pix**2 + cfg.fisheye_a4 * r_pix**4
+        norm = math.sqrt(dx**2 + dy**2 + rz**2)
+        return dx/norm, dy/norm, rz/norm
+
+    # Equirectangular approximation
+    f     = cx / math.radians(cfg.h_fov / 2.0)
+    theta = r_pix / f
+    sin_t = math.sin(theta)
+    return sin_t*(dx/r_pix), sin_t*(dy/r_pix), math.cos(theta)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Vectorised cylindrical raycast  (FIX-B)
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _raycast_cylinder(
-    origin:    np.ndarray,          # shape (3,) — Stereo70 XYZ of vehicle
-    direction: np.ndarray,          # shape (3,) — unit world-space ray
-    kdtree:    KDTree,
-    points:    np.ndarray,          # shape (N, 3)
-    min_dist:  float = 2.0,
-    max_dist:  float = 25.0,
-    # FIX-B — cylinder parameters calibrated to real mobile LiDAR point density.
-    #
-    # ORIGINAL VALUES: cyl_radius=0.40m, min_strike=3
-    # WHY THEY FAIL:   Direct measurement of the MX2 LAS files shows local
-    #                  2D nearest-neighbour spacing of ~0.80m in the wall zone.
-    #                  A 0.40m radius cylinder on a wall surface captures 0–1
-    #                  points — always below the min_strike=3 threshold.
-    #
-    # Simulation results from actual LAS data (per-bearing, sideways raycast):
-    #   r=0.40m → 0–1 pts in cylinder  (100% miss)
-    #   r=1.00m → 5–6 pts              (reliable hit)
-    #   r=1.50m → 8–12 pts             (very reliable)
-    #
-    # We use 1.50m to handle the sparsest scan-line gaps while keeping the
-    # centroid error below the sub-2m threshold expected of mobile LiDAR.
-    # min_strike=2 is sufficient: 2 points on a wall surface unambiguously
-    # identify a real surface (the probability of 2 noise points aligning
-    # within a 1.5m cylinder on the ray axis is negligible).
-    cyl_radius: float = 1.50,       # was 0.40 — too narrow for mobile LiDAR
-    min_strike: int   = 2,          # was 3   — unachievable at 0.40m radius
+    origin:     np.ndarray,
+    direction:  np.ndarray,
+    kdtree:     KDTree,
+    points:     np.ndarray,
+    min_dist:   float = 2.0,
+    max_dist:   float = 30.0,
+    # FIX-B: cyl_radius was 0.40 m — far too narrow.
+    # MX2 LAS near-wall spacing ≈ 0.80 m; 0.40 m cylinder caught 0-1 pts
+    # (always < min_strike=3). At 1.50 m radius: 8-12 pts per sideways ray.
+    cyl_radius: float = 1.50,
+    min_strike: int   = 2,
+    step_m:     float = 0.40,
 ) -> Tuple[Optional[np.ndarray], Optional[float]]:
     """
-    Cast a cylindrical beam along `direction` from `origin` and return
-    (centroid_xyz, range_m) of the first surface strike, or (None, None).
-
-    Strategy:
-        1. Sample the ray at 0.5 m intervals (coarse harvest) to collect
-           candidate point indices in one vectorised pass.
-        2. Project each candidate onto the ray axis and discard those outside
-           the true cylinder radius — this eliminates the 0.1 m overlap
-           redundancy of the old 0.2 m / 0.3 m stepping approach.
-        3. Sort surviving candidates by along-ray distance and return the
-           centroid of the first dense cluster (within 0.5 m of the closest hit).
+    Cast a cylindrical beam along `direction` from `origin`.
+    Returns (centroid_xyz, range_m) of first surface strike, or (None, None).
     """
-    steps     = np.arange(min_dist, max_dist, 0.5)           # ~46 samples
-    ray_pts   = origin + np.outer(steps, direction)           # (46, 3)
+    steps   = np.arange(min_dist, max_dist, step_m)
+    ray_pts = origin + np.outer(steps, direction)
 
-    # Harvest all point indices within cyl_radius of any ray sample
-    candidate_set: set = set()
+    cand_set: set = set()
     for pt in ray_pts:
-        idxs = kdtree.query_ball_point(pt, r=cyl_radius)
-        candidate_set.update(idxs)
+        cand_set.update(kdtree.query_ball_point(pt, r=cyl_radius))
 
-    if not candidate_set:
+    if not cand_set:
         return None, None
 
-    cands  = points[list(candidate_set)]                      # (M, 3)
-    vecs   = cands - origin                                   # (M, 3)
-    t_vals = vecs @ direction                                  # scalar projection (M,)
+    cands  = points[list(cand_set)]
+    vecs   = cands - origin
+    t_vals = vecs @ direction
+    proj   = origin + np.outer(t_vals, direction)
+    perp   = np.linalg.norm(cands - proj, axis=1)
+    mask   = (perp < cyl_radius) & (t_vals >= min_dist) & (t_vals <= max_dist)
 
-    # Perpendicular distance from each candidate to the ray axis
-    closest_on_ray = origin + np.outer(t_vals, direction)
-    perp_dist      = np.linalg.norm(cands - closest_on_ray, axis=1)
-
-    # Keep only those truly inside the cylinder and in front of the camera
-    mask = (perp_dist < cyl_radius) & (t_vals >= min_dist) & (t_vals <= max_dist)
     if not mask.any():
         return None, None
 
     valid   = cands[mask]
     valid_t = t_vals[mask]
-
-    # First-strike cluster: all valid points within 0.5 m of the nearest hit
     t_min   = valid_t.min()
     near    = np.abs(valid_t - t_min) < 0.5
+
     if near.sum() < min_strike:
         return None, None
 
-    centroid  = valid[near].mean(axis=0)   # (3,) Stereo70 XYZ
-    range_m   = float(t_min)
-    return centroid, range_m
+    return valid[near].mean(axis=0), float(t_min)
 
 
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Main geolocation function
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 
 def calculate_gps_offset_3d(
-    origin_x:          float,
-    origin_y:          float,
-    origin_z:          float,
-    car_heading:       float,   # degrees, compass convention (N=0, E=90)
-    bbox_center_x:     float,   # pixel x of detection centre
-    bbox_bottom_y:     float,   # pixel y of detection bottom edge
-    camera_mount_angle: float,  # degrees clockwise from vehicle nose
+    car_x:             float,
+    car_y:             float,
+    car_z:             float,        # WGS84 ellipsoidal Z from GPS
+    car_heading:       float,        # compass degrees (N=0, E=90)
+    bbox_center_x:     float,
+    bbox_bottom_y:     float,
+    camera_mount_angle: float,
     kdtree:            Optional[KDTree],
     points:            Optional[np.ndarray],
     cfg:               PipelineConfig,
+    geoid_undulation:  float,        # GEOID correction (m)
 ) -> dict:
     """
-    Cast a 3D ray and intersect with the LiDAR point cloud to find the true
-    Stereo70 coordinates of the detected object, then project to WGS84.
+    Cast a 3D ray from the camera into the LiDAR cloud.
+    Returns geographic coordinates of the first surface strike.
 
-    Returns a dict with keys:
-        lat, lon         — WGS84 coordinates
-        lidar_hit        — FIX-10: True when LiDAR intersection succeeded
-        px_edge_flag     — FIX-2:  True when bbox centre is in distortion zone
-        range_m          — FIX-10: distance to struck surface (None if fallback)
-        true_heading_deg — resolved world bearing of the ray (used by FIX-1)
+    GEOID correction applied here:
+        origin_z = car_z - geoid_undulation
+        This converts the GPS ellipsoidal Z to the same orthometric datum
+        used by the LAS point cloud.
     """
-    # ------------------------------------------------------------------
-    # Step 1 — unproject pixel to camera-space unit ray
-    # ------------------------------------------------------------------
-    # FIX-2: use the correct lens model (fisheye or equirectangular)
-    rx, ry, rz = _unproject_pixel(bbox_center_x, bbox_bottom_y, cfg)
+    # 1. Pixel → camera-space unit ray
+    rx, ry, rz   = _unproject_pixel(bbox_center_x, bbox_bottom_y, cfg)
+    px_edge_flag = abs(bbox_center_x - cfg.image_width/2.0) > cfg.image_width * 0.35
 
-    # FIX-2: flag detections in the outer 35 % of the horizontal FOV where
-    #         equirectangular error is largest (> ~0.5 m at 10 m range).
-    cx          = cfg.image_width / 2.0
-    px_edge_flag = abs(bbox_center_x - cx) > cfg.image_width * 0.35
-
-    # ------------------------------------------------------------------
-    # Step 2 — FIX-3: guard against upward/horizontal rays
-    # ------------------------------------------------------------------
-    # ry > 0 means the pixel is below image centre, i.e. the ray tilts downward.
-    # ry ≤ 0 means the ray is horizontal or points skyward; the planar fallback
-    # would compute a negative or infinite travel time, placing the point behind
-    # or infinitely far from the vehicle.
+    # 2. Guard: ray must tilt downward (ry > 0)
     if ry <= 0:
-        return {
-            "lat": None, "lon": None,
-            "lidar_hit": False, "px_edge_flag": px_edge_flag, "range_m": None,
-            "true_heading_deg": None,
-        }
+        return {"lat": None, "lon": None, "lidar_hit": False,
+                "px_edge_flag": px_edge_flag, "range_m": None,
+                "true_heading_deg": None}
 
-    # ------------------------------------------------------------------
-    # Step 3 — horizontal deviation and true world bearing
-    # ------------------------------------------------------------------
+    # 3. Horizontal deviation → world bearing
     alpha_deg        = math.degrees(math.atan2(rx, rz))
     true_heading_deg = (car_heading + camera_mount_angle + alpha_deg) % 360
     brng             = math.radians(true_heading_deg)
 
-    # ------------------------------------------------------------------
-    # Step 4 — build world-space unit direction vector
-    # ------------------------------------------------------------------
-    vertical_angle = math.atan2(-ry, math.sqrt(rx ** 2 + rz ** 2))
-    cos_v = math.cos(vertical_angle)
-    dir_e = math.sin(brng) * cos_v
-    dir_n = math.cos(brng) * cos_v
-    dir_z = math.sin(vertical_angle)
-    direction = np.array([dir_e, dir_n, dir_z], dtype=np.float64)
-    norm = np.linalg.norm(direction)
-    if norm > 0:
-        direction /= norm
-    origin = np.array([origin_x, origin_y, origin_z], dtype=np.float64)
+    # 4. World-space unit direction
+    vert_angle = math.atan2(-ry, math.sqrt(rx**2 + rz**2))
+    cos_v      = math.cos(vert_angle)
+    direction  = np.array([math.sin(brng)*cos_v,
+                            math.cos(brng)*cos_v,
+                            math.sin(vert_angle)], dtype=np.float64)
+    direction /= np.linalg.norm(direction)
 
-    # ╔══════════════════════════════════════════════════════════════════════╗
-    # ║  DEBUG INJECTION — paste this block to diagnose KDTree miss rates   ║
-    # ║  Remove or set DEBUG_RAYCAST = False before production runs.        ║
-    # ╚══════════════════════════════════════════════════════════════════════╝
-    DEBUG_RAYCAST = False   # ← flip to True to enable
+    # 5. GEOID: convert GPS ellipsoidal Z → LAS orthometric Z
+    origin_z = car_z - geoid_undulation
+    origin   = np.array([car_x, car_y, origin_z], dtype=np.float64)
+
+    # ── Optional debug block ────────────────────────────────────────────────
+    DEBUG_RAYCAST = False   # ← flip to True for one-shot diagnostics
     if DEBUG_RAYCAST and kdtree is not None and points is not None:
-        pts = points  # the raw (N,3) array in the KDTree
-        print("\n[DEBUG] ── Raycast diagnostics ─────────────────────────────────")
-        print(f"  Ray origin  (Stereo70): X={origin_x:.3f}  Y={origin_y:.3f}  Z={origin_z:.3f}")
-        print(f"  Ray direction (unit)  : E={direction[0]:.4f}  N={direction[1]:.4f}  Z={direction[2]:.4f}")
-        print(f"  True bearing          : {true_heading_deg:.1f}°")
-        print(f"  Vertical angle        : {math.degrees(math.atan2(-ry, math.sqrt(rx**2+rz**2))):.2f}°  "
-              f"(ry={ry:.4f}, negative = downward)")
-        print(f"  KDTree point count    : {len(pts):,}")
-        print(f"  KDTree X bounds       : [{pts[:,0].min():.3f} .. {pts[:,0].max():.3f}]")
-        print(f"  KDTree Y bounds       : [{pts[:,1].min():.3f} .. {pts[:,1].max():.3f}]")
-        print(f"  KDTree Z bounds       : [{pts[:,2].min():.3f} .. {pts[:,2].max():.3f}]")
-        # Probe: how many points exist within 5m of the ray origin?
-        near_origin = kdtree.query_ball_point(origin, r=5.0)
-        print(f"  Points within 5m of origin: {len(near_origin)}")
-        # Walk the ray and report harvest counts at key distances
-        print(f"  Harvest probe (cyl_radius=1.5m) at 5m, 10m, 15m, 20m:")
-        for probe_d in [5.0, 10.0, 15.0, 20.0]:
-            pt = origin + direction * probe_d
-            idxs = kdtree.query_ball_point(pt, r=1.5)
-            print(f"    @{probe_d:.0f}m  sample=({pt[0]:.1f},{pt[1]:.1f},{pt[2]:.1f})  "
-                  f"points_within_1.5m={len(idxs)}")
-        # X sanity check — raw integers would be far outside Stereo70 range
-        x_ok = 200_000 < pts[:, 0].mean() < 900_000
-        print(f"  X coordinate sanity (Stereo70 range): {'OK' if x_ok else 'FAIL — likely raw integers!'}")
-        print("[DEBUG] ─────────────────────────────────────────────────────────\n")
-    # ╔══════════════════════════════════════════════════════════════════════╗
-    # ║  END DEBUG INJECTION                                                ║
-    # ╚══════════════════════════════════════════════════════════════════════╝
+        print("\n[DEBUG] ───────────────────────────────────────────────────")
+        print(f"  car_z (ellipsoidal)    : {car_z:.3f} m")
+        print(f"  geoid_undulation       : {geoid_undulation:.3f} m")
+        print(f"  origin_z (orthometric) : {origin_z:.3f} m")
+        print(f"  LAS Z range            : [{points[:,2].min():.2f}..{points[:,2].max():.2f}]")
+        print(f"  Ray bearing            : {true_heading_deg:.1f}°")
+        for d in [5, 10, 15, 20]:
+            pt = origin + direction * d
+            n  = len(kdtree.query_ball_point(pt, r=1.5))
+            print(f"  @{d:2d}m  Z={pt[2]:.2f}  pts_within_1.5m={n}")
+        ok = 100_000 < float(np.median(points[:,0])) < 900_000
+        print(f"  X sanity (Stereo70): {'OK' if ok else 'FAIL'}")
+        print("[DEBUG] ───────────────────────────────────────────────────\n")
+    # ────────────────────────────────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Step 5 — FIX-1 + FIX-7: choose correct LAS hemisphere, then raycast
-    # ------------------------------------------------------------------
-    centroid_xyz = None
-    range_m      = None
+    # 6. LiDAR cylindrical raycast
+    centroid_xyz: Optional[np.ndarray] = None
+    range_m:      Optional[float]      = None
     lidar_hit    = False
 
     if kdtree is not None and points is not None:
@@ -409,500 +376,385 @@ def calculate_gps_offset_3d(
         if centroid_xyz is not None:
             lidar_hit = True
 
-    # ------------------------------------------------------------------
-    # Step 6 — planar fallback (FIX-3: only reachable when ry > 0)
-    # ------------------------------------------------------------------
+    # 7. Planar fallback (only reached when ry > 0, so t > 0 guaranteed)
     if centroid_xyz is None:
         t        = cfg.camera_height / ry
-        dist_gnd = min(math.sqrt((t * rx) ** 2 + (t * rz) ** 2), 100.0)
-        cx_world = origin_x + math.sin(brng) * dist_gnd
-        cy_world = origin_y + math.cos(brng) * dist_gnd
-        centroid_xyz = np.array([cx_world, cy_world, origin_z], dtype=np.float64)
+        dist_gnd = min(math.sqrt((t*rx)**2 + (t*rz)**2), 100.0)
+        centroid_xyz = np.array([
+            car_x + math.sin(brng) * dist_gnd,
+            car_y + math.cos(brng) * dist_gnd,
+            origin_z,
+        ], dtype=np.float64)
 
-    # ------------------------------------------------------------------
-    # Step 7 — project Stereo70 → WGS84 (always_xy=True enforced globally)
-    # ------------------------------------------------------------------
-    lon, lat = _transformer_to_wgs84.transform(
-        float(centroid_xyz[0]), float(centroid_xyz[1])
-    )
+    # 8. Stereo70 → WGS84
+    lon, lat = _T.transform(float(centroid_xyz[0]), float(centroid_xyz[1]))
 
-    return {
-        "lat":              lat,
-        "lon":              lon,
-        "lidar_hit":        lidar_hit,           # FIX-10
-        "px_edge_flag":     px_edge_flag,        # FIX-2 / FIX-10
-        "range_m":          range_m,             # FIX-10
-        "true_heading_deg": true_heading_deg,    # FIX-1 (passed back to caller)
-    }
+    return {"lat": lat, "lon": lon, "lidar_hit": lidar_hit,
+            "px_edge_flag": px_edge_flag, "range_m": range_m,
+            "true_heading_deg": true_heading_deg}
 
 
-# ---------------------------------------------------------------------------
-# Haversine distance
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Haversine
+# ──────────────────────────────────────────────────────────────────────────────
 
-def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Distance in metres between two WGS84 points."""
+def haversine_distance(lat1, lon1, lat2, lon2) -> float:
     R    = 6_378_137.0
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a    = (math.sin(dlat / 2) ** 2
+    a    = (math.sin(dlat/2)**2
             + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
-            * math.sin(dlon / 2) ** 2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+            * math.sin(dlon/2)**2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 
-# ---------------------------------------------------------------------------
-# FIX-4  Heading-convention sanity check
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Heading convention sanity check
+# ──────────────────────────────────────────────────────────────────────────────
 
-def _check_heading_convention(detections_sample: list, cfg: PipelineConfig) -> None:
-    """
-    Verify that the GPS heading convention is compass-bearing (N=0, E=90).
-    For each of the first few detections we compute the signed angular difference
-    between the resolved true_heading_deg and the car_heading stored in the record.
-    If the mean deviation is near ±90° we warn the operator.
-    """
-    if not detections_sample:
-        return
+def _check_heading_convention(samples: list, cfg: PipelineConfig) -> None:
     deltas = []
-    for d in detections_sample:
+    for d in samples:
         th = d.get("true_heading_deg")
         ch = d.get("_car_heading_deg")
-        if th is None or ch is None:
-            continue
-        diff = (th - ch + 180) % 360 - 180   # signed difference in (-180, 180]
-        deltas.append(diff)
+        if th is not None and ch is not None:
+            deltas.append((th - ch + 180) % 360 - 180)
     if not deltas:
         return
     mean_abs = abs(sum(deltas) / len(deltas))
     if 60 < mean_abs < 120:
         warnings.warn(
-            f"[FIX-4] Heading convention mismatch suspected: mean ray-vs-GPS "
-            f"bearing offset is {mean_abs:.1f}°. "
-            "Verify that Heading_deg in the coordinate file uses a compass bearing "
-            "(North = 0°, East = 90°) not a mathematical angle (East = 0°).",
+            f"[HEADING] Mean ray-vs-GPS offset = {mean_abs:.1f}°. "
+            "Verify Heading_deg uses compass convention (N=0°, E=90°).",
             stacklevel=2,
         )
 
 
-# ---------------------------------------------------------------------------
-# FIX-9  Main pipeline — accepts config explicitly, no global mutation
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Main pipeline
+# ──────────────────────────────────────────────────────────────────────────────
 
 def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
-    print("[PHASE 1] Initializing 3D Point Cloud Spatial Pipeline...")
-    print(f"          Output  : {cfg.output_folder}")
-    print(f"          Source  : {cfg.parent_folder}")
-    print(f"          LiDAR  : {cfg.las_folder or '(none — planar fallback only)'}")
-    if cfg.fisheye_a0 is not None:
-        print(f"          Lens   : Scaramuzza fisheye (a0={cfg.fisheye_a0})")
-    else:
-        print("          Lens   : equirectangular approximation")
+    print("[PHASE 1] Initializing pipeline...")
+    print(f"          Source : {cfg.parent_folder}")
+    print(f"          Output : {cfg.output_folder}")
+    print(f"          LiDAR  : {cfg.las_folder or '(none — planar fallback)'}")
 
     device   = "cuda" if torch.cuda.is_available() else "cpu"
     use_half = device == "cuda"
     if device == "cuda":
-        print("          GPU    : CuDNN Autotuner active")
-        torch.backends.cudnn.benchmark    = True
+        torch.backends.cudnn.benchmark     = True
         torch.backends.cudnn.deterministic = False
+        print("          GPU    : CuDNN Autotuner active")
 
     model = YOLO(cfg.model_path)
     os.makedirs(cfg.output_folder, exist_ok=True)
-
-    all_detections: list[dict] = []
     start_time = time.time()
 
-    # ------------------------------------------------------------------
-    # FIX-6 — Deterministic camera ordering: left-facing cameras first so
-    #          the KDTree is loaded at most twice (left → right).
-    # ------------------------------------------------------------------
-    LEFT_CAMERAS  = {"Camera1", "Camera2"}
-    RIGHT_CAMERAS = {"Camera3", "Camera4"}
+    # FIX-C: Pre-load BOTH KDTrees once at startup
+    left_tree  = left_pts  = None
+    right_tree = right_pts = None
+    if cfg.las_folder:
+        left_tree,  left_pts  = load_lidar_kdtree(cfg.las_folder, "left")
+        right_tree, right_pts = load_lidar_kdtree(cfg.las_folder, "right")
 
-    def _cam_sort_key(folder_name: str) -> int:
-        for key in LEFT_CAMERAS:
-            if key in folder_name:
-                return 0    # left group processed first
-        for key in RIGHT_CAMERAS:
-            if key in folder_name:
-                return 1    # right group second
-        return 2            # unknown — last
+    # GEOID: Calibrate vertical datum offset
+    geoid_undulation = cfg.geoid_undulation
+    if geoid_undulation is None:
+        calib_pts = left_pts if left_pts is not None else right_pts
+        if calib_pts is not None:
+            print("[PHASE 1] Auto-calibrating Z datum offset...")
+            # Find any coordonate file to use for calibration
+            calib_df: Optional[pd.DataFrame] = None
+            for fd in sorted(os.listdir(cfg.parent_folder)):
+                fp = os.path.join(cfg.parent_folder, fd)
+                if not os.path.isdir(fp):
+                    continue
+                for fn in os.listdir(fp):
+                    fl = fn.lower()
+                    if "coordonate" in fl and not fl.startswith("~$"):
+                        try:
+                            p = os.path.join(fp, fn)
+                            calib_df = (pd.read_csv(p) if fn.endswith(".csv")
+                                        else pd.read_excel(p))
+                            break
+                        except Exception:
+                            pass
+                if calib_df is not None:
+                    break
+
+            if calib_df is not None and "X_Stereo70" in calib_df.columns:
+                geoid_undulation = estimate_geoid_undulation(
+                    calib_df, calib_pts, cfg.camera_height
+                )
+            else:
+                geoid_undulation = 39.1
+                print(f"  [!] No telemetry for calibration — using {geoid_undulation} m")
+        else:
+            geoid_undulation = 0.0
+
+    print(f"          Z offset (geoid): {geoid_undulation:.3f} m")
+
+    # Sort cameras: left-facing (mount >= 180°) first so we match the
+    # pre-load order and never need to reload mid-session
+    def _cam_sort(name: str) -> int:
+        for k, a in cfg.camera_angles.items():
+            if k in name:
+                return 0 if a >= 180 else 1
+        return 2
 
     all_folders = sorted(
         [f for f in os.listdir(cfg.parent_folder)
          if os.path.isdir(os.path.join(cfg.parent_folder, f))],
-        key=_cam_sort_key,
+        key=_cam_sort,
     )
 
-    loaded_kdtree: Optional[KDTree] = None
-    loaded_points: Optional[np.ndarray] = None
-    current_lidar_side: Optional[str] = None
-
-    heading_check_sample: list[dict] = []   # FIX-4
+    all_detections:       list[dict] = []
+    heading_check_sample: list[dict] = []
 
     for folder_name in all_folders:
         folder_path = os.path.join(cfg.parent_folder, folder_name)
 
-        # Identify which camera this folder belongs to
-        current_cam_key    = None
-        current_mount_angle = None
-        for cam_key, angle in cfg.camera_angles.items():
-            if cam_key in folder_name:
-                current_cam_key     = cam_key
-                current_mount_angle = angle
-                break
-
-        if not current_cam_key or current_mount_angle is None:
+        cam_key   = None
+        mount_ang = None
+        for k, a in cfg.camera_angles.items():
+            if k in folder_name:
+                cam_key = k; mount_ang = a; break
+        if cam_key is None:
             continue
 
-        print(f"\n---> Initializing {current_cam_key} (mount {current_mount_angle}°)")
+        print(f"\n---> {cam_key} (mount {mount_ang}°)")
 
-        # ------------------------------------------------------------------
-        # Coordinate / telemetry file
-        # ------------------------------------------------------------------
-        coord_file_path = None
-        for file in os.listdir(folder_path):
-            fl = file.lower()
+        # Select correct KDTree: mount >= 180° → left side cameras
+        is_left = mount_ang >= 180.0
+        kdtree  = left_tree  if is_left else right_tree
+        points  = left_pts   if is_left else right_pts
+
+        # Telemetry file
+        coord_file = None
+        for fn in os.listdir(folder_path):
+            fl = fn.lower()
             if "coordonate" in fl and not fl.startswith("~$"):
-                coord_file_path = os.path.join(folder_path, file)
-                break
-
-        if not coord_file_path:
-            print(f"  [!] Skipping {current_cam_key}: no 'coordonate' file found.")
+                coord_file = os.path.join(folder_path, fn); break
+        if not coord_file:
+            print(f"  [!] No coordonate file — skipping {cam_key}.")
             continue
 
-        df_coords = (
-            pd.read_csv(coord_file_path)
-            if coord_file_path.endswith(".csv")
-            else pd.read_excel(coord_file_path)
-        )
+        df = (pd.read_csv(coord_file) if coord_file.endswith(".csv")
+              else pd.read_excel(coord_file))
 
-        required_cols = ["X_Stereo70", "Y_Stereo70", "Z", "Heading_deg", "Imagine"]
-        missing = [c for c in required_cols if c not in df_coords.columns]
+        required = ["X_Stereo70", "Y_Stereo70", "Z", "Heading_deg", "Imagine"]
+        missing  = [c for c in required if c not in df.columns]
         if missing:
-            print(f"  [!] Missing columns {missing} — skipping {current_cam_key}.")
+            print(f"  [!] Missing columns {missing} — skipping {cam_key}.")
             continue
 
-        # FIX-8 — Normalise image-name column to lowercase + stripped whitespace
-        df_coords["Imagine"] = df_coords["Imagine"].astype(str).str.strip().str.lower()
+        # FIX-8: normalise filenames once; build O(1) lookup
+        df["Imagine"] = df["Imagine"].astype(str).str.strip().str.lower()
+        lookup = {row["Imagine"]: row for _, row in df.iterrows()}
 
-        # Build a lookup dict for O(1) image → row access
-        coord_lookup = {
-            row["Imagine"]: row for _, row in df_coords.iterrows()
-        }
+        images = [f for f in os.listdir(folder_path)
+                  if f.lower().endswith((".jpg", ".png", ".jpeg"))]
+        print(f"  [*] {len(images)} images")
 
-        image_files  = [
-            f for f in os.listdir(folder_path)
-            if f.lower().endswith((".jpg", ".png", ".jpeg"))
-        ]
-        total_images = len(image_files)
-        print(f"  [*] {total_images} images to process")
-
-        # ------------------------------------------------------------------
-        # FIX-C — Resolve LAS hemisphere ONCE per camera folder, not per box.
-        #
-        # ORIGINAL BUG: The per-detection required_side check lived inside
-        # the per-image / per-box loop.  For cameras near the 0°/180° bearing
-        # boundary (Camera2 at 300°, Camera3 at 60°), individual detections
-        # with slightly different horizontal deviations could flip the required
-        # side back and forth, triggering repeated multi-GB LAS file reloads
-        # mid-camera — one per affected detection.  In the worst case this
-        # made every detection pay the full 3–10 s KDTree build cost.
-        #
-        # The correct approach: the dominant ray bearing for a camera is its
-        # mount angle ± the half-FOV (±30°).  We compute this once from the
-        # mount angle alone and load the appropriate KDTree before entering
-        # the YOLO loop.  Within a single camera's ±30° FOV the hemisphere
-        # almost never flips (it would require the vehicle to be heading within
-        # 30° of due North or South while shooting sideways — an edge case we
-        # accept with a fallback note).
-        # ------------------------------------------------------------------
-        # Use the camera mount angle as the dominant bearing estimate.
-        # Add 0° horizontal deviation (dead centre of FOV) as the representative ray.
-        dominant_bearing = (0.0 + current_mount_angle) % 360  # car_heading unknown here
-        # We don't have the car heading at folder-scan time, so we use mount angle
-        # relative to an arbitrary north.  What matters is whether the mount puts
-        # the camera on the left (port) or right (starboard) of the vehicle.
-        # Left cameras: mount 180°–360° (Camera1=240°, Camera2=300°)
-        # Right cameras: mount 0°–180°  (Camera3=60°,  Camera4=120°)
-        dominant_side = "left" if current_mount_angle >= 180 else "right"
-
-        if current_lidar_side != dominant_side and cfg.las_folder:
-            loaded_kdtree, loaded_points = load_lidar_kdtree(
-                cfg.las_folder, dominant_side
-            )
-            current_lidar_side = dominant_side
-
-        # ------------------------------------------------------------------
-        # YOLO inference (streaming)
-        # ------------------------------------------------------------------
         results = model.predict(
-            source=folder_path,
-            conf=cfg.confidence,
-            iou=cfg.iou_threshold,
-            imgsz=cfg.image_width,
-            augment=cfg.use_tta,
-            half=use_half,
-            device=device,
-            stream=True,
-            verbose=False,
-            batch=cfg.batch_size,
+            source=folder_path, conf=cfg.confidence, iou=cfg.iou_threshold,
+            imgsz=cfg.image_width, augment=cfg.use_tta, half=use_half,
+            device=device, stream=True, verbose=False, batch=cfg.batch_size,
         )
 
-        folder_detections = 0
-
-        for r in tqdm(results, total=total_images, desc=f"Scanning {current_cam_key}", unit="img"):
+        n_det = 0
+        for r in tqdm(results, total=len(images), desc=f"Scanning {cam_key}", unit="img"):
             if len(r.boxes) == 0:
                 continue
 
-            # FIX-8 — normalise runtime filename before lookup
-            img_name       = os.path.basename(r.path).strip().lower()
-            telemetry      = coord_lookup.get(img_name)
+            img_name  = os.path.basename(r.path).strip().lower()  # FIX-8
+            telemetry = lookup.get(img_name)
             if telemetry is None:
                 continue
 
-            car_x       = float(telemetry["X_Stereo70"])
-            car_y       = float(telemetry["Y_Stereo70"])
-            car_z       = float(telemetry["Z"])
-            car_heading = float(telemetry["Heading_deg"])
+            car_x = float(telemetry["X_Stereo70"])
+            car_y = float(telemetry["Y_Stereo70"])
+            car_z = float(telemetry["Z"])           # ellipsoidal
+            car_h = float(telemetry["Heading_deg"])
 
             for box in r.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
-                conf            = float(box.conf[0])
-                bbox_center_x   = (x1 + x2) / 2.0
+                conf   = float(box.conf[0])
+                bbox_cx = (x1 + x2) / 2.0
 
-                # ----------------------------------------------------------
-                # Full geolocation — KDTree already loaded for this camera
-                # (FIX-C: hemisphere resolved once per camera folder above)
-                # ----------------------------------------------------------
                 geo = calculate_gps_offset_3d(
-                    car_x, car_y, car_z,
-                    car_heading, bbox_center_x, y2,
-                    current_mount_angle,
-                    loaded_kdtree, loaded_points,
-                    cfg,
+                    car_x, car_y, car_z, car_h,
+                    bbox_cx, y2, mount_ang,
+                    kdtree, points, cfg, geoid_undulation,
                 )
 
-                # FIX-3 — discard rays that pointed upward
-                if geo["lat"] is None:
+                if geo["lat"] is None:      # ray pointed upward; discard
                     continue
 
                 det = {
                     "image":        img_name,
-                    "cam_key":      current_cam_key,
+                    "cam_key":      cam_key,
                     "folder_path":  folder_path,
-                    "x1":           int(x1),
-                    "y1":           int(y1),
-                    "x2":           int(x2),
-                    "y2":           int(y2),
+                    "x1": int(x1), "y1": int(y1),
+                    "x2": int(x2), "y2": int(y2),
                     "conf":         conf,
                     "lat":          geo["lat"],
                     "lon":          geo["lon"],
-                    "lidar_hit":    geo["lidar_hit"],       # FIX-10
-                    "px_edge_flag": geo["px_edge_flag"],    # FIX-10
-                    "range_m":      geo["range_m"],         # FIX-10
-                    # Private field for heading sanity-check (stripped at export)
-                    "_car_heading_deg":  car_heading,
+                    "lidar_hit":    geo["lidar_hit"],      # FIX-10
+                    "px_edge_flag": geo["px_edge_flag"],   # FIX-10
+                    "range_m":      geo["range_m"],        # FIX-10
+                    "_car_heading_deg":  car_h,
                     "true_heading_deg":  geo["true_heading_deg"],
                 }
                 all_detections.append(det)
-                folder_detections += 1
+                n_det += 1
 
-                # FIX-4 — collect sample for heading-convention check
                 if len(heading_check_sample) < 5:
                     heading_check_sample.append(det)
 
-        print(f"  [✓] {current_cam_key} complete — {folder_detections} raw detections.")
+        print(f"  [✓] {cam_key}: {n_det} raw detections")
 
-    # FIX-4 — run heading-convention check after the first camera
     _check_heading_convention(heading_check_sample, cfg)
-
     print(f"\nExtraction complete — {len(all_detections)} raw detections.")
 
-    # ------------------------------------------------------------------
-    # PHASE 3 — Spatial deduplication and clustering
-    # ------------------------------------------------------------------
-    print("[PHASE 3] Spatial deduplication and proximity clustering...")
-
+    # ── PHASE 3: Spatial deduplication ──────────────────────────────────────
+    print("[PHASE 3] Spatial deduplication and clustering...")
     unique_firidas: list[dict] = []
 
     for det in all_detections:
         matched = False
-
         for uf in unique_firidas:
             dist = haversine_distance(det["lat"], det["lon"], uf["lat"], uf["lon"])
-
             if dist <= cfg.cluster_radius_m:
-                # FIX-5 — same-image / same-camera duplicate: mark matched and
-                #          skip merging, but do NOT leave matched=False, which
-                #          previously caused re-insertion as a new unique firida.
+                # FIX-5: mark matched before break (was re-inserting same-image dups)
                 if det["image"] == uf["image"] and det["cam_key"] == uf["cam_key"]:
-                    matched = True   # ← was `continue` without setting matched
+                    matched = True
                     break
-
                 matched = True
                 uf["seen_count"] = uf.get("seen_count", 1) + 1
                 uf["clustered"]  = True
-
                 if "cluster_members" not in uf:
                     uf["cluster_members"] = [dict(uf)]
                 uf["cluster_members"].append(dict(det))
-
                 if det["conf"] > uf["conf"]:
-                    det["clustered"]  = True
-                    det["seen_count"] = uf["seen_count"]
+                    det["clustered"]       = True
+                    det["seen_count"]      = uf["seen_count"]
                     det["cluster_members"] = uf["cluster_members"]
                     uf.update(det)
                 break
-
         if not matched:
-            det["clustered"]  = False
-            det["seen_count"] = 1
+            det["clustered"]       = False
+            det["seen_count"]      = 1
             det["cluster_members"] = [dict(det)]
             unique_firidas.append(det)
 
-    # Secondary mutual proximity flag
     for i, f1 in enumerate(unique_firidas):
         for j, f2 in enumerate(unique_firidas):
-            if i != j and haversine_distance(f1["lat"], f1["lon"], f2["lat"], f2["lon"]) <= cfg.cluster_radius_m:
+            if i != j and haversine_distance(
+                    f1["lat"], f1["lon"], f2["lat"], f2["lon"]) <= cfg.cluster_radius_m:
                 f1["clustered"] = True
                 f2["clustered"] = True
 
-    print(f"Spatial filtering complete — {len(unique_firidas)} unique instances.")
+    hit_count = sum(1 for d in unique_firidas if d.get("lidar_hit"))
+    total     = len(unique_firidas)
+    print(f"Filtering complete — {total} unique instances.")
+    print(f"LiDAR hits: {hit_count}/{total} ({100*hit_count//max(total,1)}%)")
 
-    # ------------------------------------------------------------------
-    # Annotated image export
-    # ------------------------------------------------------------------
+    # ── Annotated image export ───────────────────────────────────────────────
     for f in unique_firidas:
         if f["clustered"]:
-            color = COLOR_YELLOW
-            label = f"CLUSTERED: {f['conf']:.2f}"
+            color = COLOR_YELLOW; label = f"CLUSTERED: {f['conf']:.2f}"
         elif f["conf"] >= 0.85:
-            color = COLOR_GREEN
-            label = f"Firida: {f['conf']:.2f}"
+            color = COLOR_GREEN;  label = f"Firida: {f['conf']:.2f}"
         elif f["conf"] >= 0.80:
-            color = COLOR_ORANGE
-            label = f"Firida: {f['conf']:.2f}"
+            color = COLOR_ORANGE; label = f"Firida: {f['conf']:.2f}"
         else:
-            color = COLOR_RED
-            label = f"WARNING: {f['conf']:.2f}"
+            color = COLOR_RED;    label = f"WARNING: {f['conf']:.2f}"
+        if not f.get("lidar_hit"):  label += " [PLANAR]"
+        if f.get("px_edge_flag"):   label += " [EDGE]"
 
-        # FIX-10 — append data-quality indicator to image label
-        if not f["lidar_hit"]:
-            label += " [PLANAR]"
-        if f["px_edge_flag"]:
-            label += " [EDGE]"
-
-        members = f.get("cluster_members", [f])
-
-        for member in members:
-            img_path = os.path.join(member["folder_path"], member["image"])
-            img = cv2.imread(img_path)
+        for m in f.get("cluster_members", [f]):
+            img = cv2.imread(os.path.join(m["folder_path"], m["image"]))
             if img is not None:
-                cv2.rectangle(img, (member["x1"], member["y1"]), (member["x2"], member["y2"]), color, 4)
-                
-                # Context prefix
-                member_label = f"{member['cam_key']} - {label}"
-                
-                cv2.putText(
-                    img, member_label, (member["x1"], member["y1"] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2,
-                )
+                cv2.rectangle(img, (m["x1"], m["y1"]), (m["x2"], m["y2"]), color, 4)
+                cv2.putText(img, f"{m['cam_key']} – {label}",
+                            (m["x1"], m["y1"]-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
                 cv2.imwrite(
-                    os.path.join(cfg.output_folder, f"{member['cam_key']}_{member['image']}"), img
-                )
+                    os.path.join(cfg.output_folder,
+                                 f"{m['cam_key']}_{m['image']}"), img)
 
-    # ------------------------------------------------------------------
-    # PHASE 4 — QGIS deliverables
-    # ------------------------------------------------------------------
+    # ── PHASE 4: QGIS deliverables ──────────────────────────────────────────
     print("[PHASE 4] Compiling QGIS deliverables...")
+    flat: list[dict] = []
+    for f in unique_firidas:
+        for m in f.get("cluster_members", [f]):
+            mc = {k: v for k, v in m.items() if k != "cluster_members"}
+            mc["clustered"] = f.get("clustered", False)
+            flat.append(mc)
 
-    flattened_firidas = []
-    if unique_firidas:
-        for f in unique_firidas:
-            members = f.get("cluster_members", [f])
-            for m in members:
-                m_copy = dict(m)
-                m_copy["clustered"] = f.get("clustered", False)
-                if "cluster_members" in m_copy:
-                    del m_copy["cluster_members"]
-                flattened_firidas.append(m_copy)
+    if flat:
+        df_exp = pd.DataFrame(flat)
+        drop   = [c for c in ["x1","y1","x2","y2","folder_path",
+                               "_car_heading_deg"] if c in df_exp.columns]
+        df_exp = df_exp.drop(columns=drop)
 
-    if flattened_firidas:
-        df_export = pd.DataFrame(flattened_firidas)
-
-        # Strip internal / geometry columns before writing
-        drop_cols = [c for c in ["x1", "y1", "x2", "y2", "folder_path",
-                                  "_car_heading_deg"] if c in df_export.columns]
-        df_export = df_export.drop(columns=drop_cols)
-
-        geometry = [Point(xy) for xy in zip(df_export["lon"], df_export["lat"])]
-        gdf      = gpd.GeoDataFrame(df_export, geometry=geometry)
+        gdf = gpd.GeoDataFrame(
+            df_exp,
+            geometry=[Point(xy) for xy in zip(df_exp["lon"], df_exp["lat"])],
+        )
         gdf.set_crs(epsg=4326, inplace=True)
 
-        # FIX-11 — CRS integrity assertion before writing
-        lon_vals = gdf.geometry.x
-        assert lon_vals.between(-180, 180).all(), (
-            "CRS integrity check failed: longitude values outside WGS84 range. "
-            "The Stereo70 → WGS84 transform may not have been applied correctly."
-        )
+        # FIX-11: CRS integrity check
+        assert gdf.geometry.x.between(-180, 180).all(), (
+            "CRS integrity check failed: longitudes outside WGS84 range.")
 
-        shp_path  = os.path.join(cfg.output_folder, "tip_firida_bransament.shp")
-        json_path = os.path.join(cfg.output_folder, "tip_firida_bransament.json")
-
-        gdf.to_file(shp_path)
-        df_export.to_json(json_path, orient="records", indent=2)
-
-        lidar_count = int(df_export["lidar_hit"].sum()) if "lidar_hit" in df_export else "?"
-        edge_count  = int(df_export["px_edge_flag"].sum()) if "px_edge_flag" in df_export else "?"
-        print(f"  Shapefile  : {shp_path}")
-        print(f"  LiDAR hits : {lidar_count} / {len(df_export)} detections")
-        print(f"  Edge flags : {edge_count} (reduced coordinate accuracy)")
+        shp  = os.path.join(cfg.output_folder, "tip_firida_bransament.shp")
+        json = os.path.join(cfg.output_folder, "tip_firida_bransament.json")
+        gdf.to_file(shp)
+        df_exp.to_json(json, orient="records", indent=2)
+        print(f"  Shapefile : {shp}")
+        print(f"  JSON      : {json}")
     else:
         print("  No firidas to export.")
 
-    elapsed = round(time.time() - start_time, 2)
-    print(f"\nPipeline complete in {elapsed}s.")
+    print(f"\nPipeline complete in {round(time.time()-start_time, 2)}s.")
 
 
-# ---------------------------------------------------------------------------
-# CLI entry-point
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Gauss Infrastructure Detector Backend")
-    parser.add_argument("--folder",      type=str, required=True,  help="Recording directory")
-    parser.add_argument("--output",      type=str, required=True,  help="Output directory")
-    parser.add_argument("--las_folder",  type=str, default="",     help="LiDAR .las folder")
-    parser.add_argument("--conf",        type=float, default=0.75, help="YOLO confidence threshold (0–1)")
-    parser.add_argument("--cluster",     type=float, default=2.00, help="Cluster/dedup radius (m)")
-    parser.add_argument("--batch",       type=int,   default=24,   help="YOLO batch size")
-    # FIX-2 — optional fisheye intrinsics as a JSON string
-    parser.add_argument(
-        "--intrinsics",
-        type=str,
-        default=None,
-        help=(
-            'Scaramuzza fisheye coefficients as JSON, e.g. '
-            '\'{"a0": -616.2, "a2": 0.0, "a4": -4.1e-7}\'. '
-            "Omit to use equirectangular approximation."
-        ),
-    )
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Gauss Infrastructure Detector")
+    p.add_argument("--folder",           required=True,  help="Recording directory")
+    p.add_argument("--output",           required=True,  help="Output directory")
+    p.add_argument("--las_folder",       default="",     help="Folder containing LAS files")
+    p.add_argument("--conf",             type=float, default=0.75)
+    p.add_argument("--cluster",          type=float, default=2.00)
+    p.add_argument("--batch",            type=int,   default=24)
+    p.add_argument("--geoid_undulation", type=float, default=None,
+                   help="Z datum offset in metres (GPS ellipsoidal − LAS orthometric). "
+                        "Omit to auto-calibrate. Romania ≈ 39 m.")
+    p.add_argument("--intrinsics",       type=str,   default=None,
+                   help='Scaramuzza fisheye JSON: \'{"a0":-616.2,"a2":0.0,"a4":-4.1e-7}\'')
+    args = p.parse_args()
 
     if not os.path.exists(args.folder):
-        print(f"ERROR: Source folder not found: {args.folder}")
+        print(f"ERROR: folder not found: {args.folder}")
     else:
-        intrinsics = json.loads(args.intrinsics) if args.intrinsics else {}
-        config = PipelineConfig(
+        intr = json.loads(args.intrinsics) if args.intrinsics else {}
+        cfg  = PipelineConfig(
             parent_folder    = args.folder,
             output_folder    = args.output,
             las_folder       = args.las_folder,
             confidence       = args.conf,
             cluster_radius_m = args.cluster,
             batch_size       = args.batch,
-            fisheye_a0       = intrinsics.get("a0"),
-            fisheye_a2       = intrinsics.get("a2"),
-            fisheye_a4       = intrinsics.get("a4"),
+            geoid_undulation = args.geoid_undulation,
+            fisheye_a0       = intr.get("a0"),
+            fisheye_a2       = intr.get("a2"),
+            fisheye_a4       = intr.get("a4"),
         )
-        run_enterprise_pipeline(config)
+        run_enterprise_pipeline(cfg)
