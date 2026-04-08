@@ -5,10 +5,11 @@
 # then tries to figure out where each detected firida actually is in the real world
 # using the LiDAR point cloud. Falls back to flat-ground math if LiDAR misses.
 #
+# Quick note on the Z coordinate issue we spent way too long on:
 # The GPS altitude in the coordonate.csv is WGS84 ellipsoidal height (~287m here).
 # The LAS files store orthometric height referenced to the Black Sea datum (~247m).
 # That's a ~39m gap, which means every single ray was flying 39m above the point cloud.
-# I auto-detect this offset at startup by comparing GPS Z to the nearest ground points
+# We auto-detect this offset at startup by comparing GPS Z to the nearest ground points
 # in the LAS file. For this area of Romania it's consistently around 39.1m.
 
 from __future__ import annotations
@@ -52,7 +53,11 @@ class PipelineConfig:
     # detection thresholds
     confidence:       float = 0.75
     iou_threshold:    float = 0.45
-    cluster_radius_m: float = 2.00   # how close two detections need to be to count as the same firida
+    cluster_radius_m:       float = 2.00   # tight same-camera dedup radius (metres)
+    cross_camera_radius_m:  float = 8.00   # wider cross-camera merge radius (metres).
+                                            # rays from different camera angles land a few metres
+                                            # apart even for the same firida, so we need a looser
+                                            # threshold here than the same-camera pass.
 
     # camera / image settings
     image_width:      int   = 1280
@@ -691,13 +696,54 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
             det["cluster_members"] = [dict(det)]
             unique_firidas.append(det)
 
-    # second pass to catch any pairs we missed in the first round
-    for i, f1 in enumerate(unique_firidas):
-        for j, f2 in enumerate(unique_firidas):
-            if i != j and haversine_distance(
-                    f1["lat"], f1["lon"], f2["lat"], f2["lon"]) <= cfg.cluster_radius_m:
-                f1["clustered"] = True
-                f2["clustered"] = True
+    # Cross-camera merge pass.
+    #
+    # The first pass above uses a tight 2m radius which works great for the same
+    # camera seeing the same firida multiple times as the car drives past. But when
+    # two different cameras both spot the same firida, their ray angles are different
+    # and the calculated coordinates can land 3-8m apart even for the same object.
+    # The 2m threshold misses those matches.
+    #
+    # This pass uses a wider radius and, crucially, actually merges the cluster_members
+    # lists so the gallery ends up with all the photos together in one group. The old
+    # version only set clustered=True without combining anything, which is why you'd
+    # see two separate yellow entries for the same firida.
+    #
+    # We loop until nothing changes because merging two groups can create new pairs.
+    did_merge = True
+    while did_merge:
+        did_merge = False
+        i = 0
+        while i < len(unique_firidas):
+            j = i + 1
+            while j < len(unique_firidas):
+                fi = unique_firidas[i]
+                fj = unique_firidas[j]
+                dist = haversine_distance(fi["lat"], fi["lon"], fj["lat"], fj["lon"])
+                if dist <= cfg.cross_camera_radius_m:
+                    # merge fj into fi — combine their photo lists
+                    if "cluster_members" not in fi:
+                        fi["cluster_members"] = [dict(fi)]
+                    fi["cluster_members"].extend(fj.get("cluster_members", [dict(fj)]))
+                    fi["seen_count"] = fi.get("seen_count", 1) + fj.get("seen_count", 1)
+                    fi["clustered"]  = True
+
+                    # if fj had the better confidence, promote it as the representative
+                    # but keep the merged member list we just built
+                    if fj["conf"] > fi["conf"]:
+                        best = dict(fj)
+                        best["cluster_members"] = fi["cluster_members"]
+                        best["seen_count"]      = fi["seen_count"]
+                        best["clustered"]       = True
+                        unique_firidas[i]       = best
+                        fi = unique_firidas[i]
+
+                    unique_firidas.pop(j)
+                    did_merge = True
+                    # don't increment j — the list just got shorter
+                else:
+                    j += 1
+            i += 1
 
     hit_count = sum(1 for d in unique_firidas if d.get("lidar_hit"))
     total     = len(unique_firidas)
@@ -780,7 +826,10 @@ if __name__ == "__main__":
     p.add_argument("--output",           required=True,  help="Where to save results")
     p.add_argument("--las_folder",       default="",     help="Folder with the left/right .las files")
     p.add_argument("--conf",             type=float, default=0.75, help="YOLO confidence threshold")
-    p.add_argument("--cluster",          type=float, default=2.00, help="Cluster radius in metres")
+    p.add_argument("--cluster",              type=float, default=2.00, help="Same-camera dedup radius in metres")
+    p.add_argument("--cross_camera_radius",  type=float, default=8.00,
+                   help="Cross-camera merge radius in metres. Wider than --cluster because "
+                        "rays from different angles land a few metres apart for the same firida.")
     p.add_argument("--batch",            type=int,   default=24,   help="YOLO batch size")
     p.add_argument("--geoid_undulation", type=float, default=None,
                    help="Z offset in metres between GPS altitude and LAS orthometric height. "
@@ -794,15 +843,16 @@ if __name__ == "__main__":
     else:
         intr = json.loads(args.intrinsics) if args.intrinsics else {}
         cfg  = PipelineConfig(
-            parent_folder    = args.folder,
-            output_folder    = args.output,
-            las_folder       = args.las_folder,
-            confidence       = args.conf,
-            cluster_radius_m = args.cluster,
-            batch_size       = args.batch,
-            geoid_undulation = args.geoid_undulation,
-            fisheye_a0       = intr.get("a0"),
-            fisheye_a2       = intr.get("a2"),
-            fisheye_a4       = intr.get("a4"),
+            parent_folder         = args.folder,
+            output_folder         = args.output,
+            las_folder            = args.las_folder,
+            confidence            = args.conf,
+            cluster_radius_m      = args.cluster,
+            cross_camera_radius_m = args.cross_camera_radius,
+            batch_size            = args.batch,
+            geoid_undulation      = args.geoid_undulation,
+            fisheye_a0            = intr.get("a0"),
+            fisheye_a2            = intr.get("a2"),
+            fisheye_a4            = intr.get("a4"),
         )
         run_enterprise_pipeline(cfg)
