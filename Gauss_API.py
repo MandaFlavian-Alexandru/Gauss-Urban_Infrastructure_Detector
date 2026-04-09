@@ -12,18 +12,58 @@ import tempfile
 import signal
 import time
 import uuid
+import pathlib
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, FileResponse
 from pydantic import BaseModel
 from typing import Optional
 
-# --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("Gauss_FastAPI")
+
+# only these two values are accepted for execution_mode
+ALLOWED_EXECUTION_MODES = {"parallel", "sequential"}
+
+def _validate_session_id(session_id: str) -> str:
+    """
+    Checks that a session_id is a valid UUID before we use it to build file paths.
+    A crafted value like '../../etc/passwd' would be a path traversal attack otherwise.
+    """
+    try:
+        return str(uuid.UUID(session_id))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid session ID format.") from e
+
+def _validate_directory_path(path: str) -> str:
+    """
+    Resolves a user-supplied directory path to its real absolute form and
+    checks it actually exists as a directory.
+
+    os.path.realpath resolves symlinks and any ../ traversal, so we get the
+    true path the OS would use. We also confirm it's a directory, not a file
+    or device node or anything else someone might try to slip in.
+    """
+    if not path or not isinstance(path, str):
+        raise HTTPException(status_code=400, detail="Path must be a non-empty string.")
+    resolved = os.path.realpath(os.path.abspath(path))
+    if not os.path.exists(resolved):
+        raise HTTPException(status_code=400, detail=f"Path does not exist: {path}")
+    if not os.path.isdir(resolved):
+        raise HTTPException(status_code=400, detail=f"Path is not a directory: {path}")
+    return resolved
+
+def _validate_numeric(value: float, name: str, lo: float, hi: float) -> float:
+    """Range check for numeric params that end up in the subprocess command."""
+    if not (lo <= value <= hi):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name} must be between {lo} and {hi}, got {value}."
+        )
+    return value
 
 app = FastAPI(title="Gauss Infrastructure Detector API", version="1.0.0")
 
@@ -84,6 +124,14 @@ class FinalExportRequest(BaseModel):
 
 def run_subprocess(session_id: str, folder_path: str, las_folder_path: str, conf: float, cluster: float, batch_size: int, output_dir: str):
     """Executes the Gauss backend pipeline as a subprocess and monitors its stdout."""
+
+    # all three paths were resolved and validated before this function was called,
+    # but we resolve them again here as a defence-in-depth measure in case this
+    # function is ever called from somewhere else in the future.
+    folder_path    = os.path.realpath(folder_path)
+    las_folder_path = os.path.realpath(las_folder_path) if las_folder_path else ""
+    output_dir     = os.path.realpath(output_dir)
+
     for f in glob.glob(os.path.join(output_dir, "tip_firida_bransament.*")): 
         try: 
             os.remove(f)
@@ -100,18 +148,28 @@ def run_subprocess(session_id: str, folder_path: str, las_folder_path: str, conf
     st["progress"] = 0
     st["camera_progress"] = {"Camera1": 0, "Camera2": 0, "Camera3": 0, "Camera4": 0}
     st["results_ready"] = False
-    
+
+    # build the command as a list (never a string) so the OS never passes it
+    # through a shell. each argument is a separate list element, which means
+    # special characters like semicolons, pipes, or backticks in a path are
+    # treated as literal characters and cannot be used for injection.
     cmd = [
-        sys.executable, "Gauss_UID_Backend.py",
-        "--folder", folder_path,
+        sys.executable, os.path.abspath("Gauss_UID_Backend.py"),
+        "--folder",     folder_path,
         "--las_folder", las_folder_path,
-        "--conf", str(conf / 100.0),
-        "--cluster", str(cluster),
-        "--batch", str(batch_size),
-        "--output", output_dir 
+        "--conf",       str(round(conf / 100.0, 4)),
+        "--cluster",    str(round(cluster, 4)),
+        "--batch",      str(int(batch_size)),
+        "--output",     output_dir,
     ]
     
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, shell=False)
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        shell=False,   # never True — shell=True is what enables injection
+    )
     st["process_id"] = process.pid
     save_state(session_id, st)
     
@@ -177,25 +235,47 @@ def run_sequential_batch(sessions_to_run):
 @app.post("/api/analyze")
 def start_analysis(req: AnalysisRequest):
     print(f"*** Batch Request Received. Target Execution Mode: {req.execution_mode.upper()} ***")
-    
-    if not os.path.exists(req.folder_path) or not os.path.isdir(req.folder_path):
+
+    # validate execution_mode against an explicit allowlist.
+    # without this, any string would silently fall through to the else branch
+    # and be treated as "parallel" — not dangerous on its own, but still wrong.
+    if req.execution_mode not in ALLOWED_EXECUTION_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid execution_mode '{req.execution_mode}'. Must be one of: {ALLOWED_EXECUTION_MODES}"
+        )
+
+    # validate and resolve paths — realpath strips any ../ traversal attempts
+    try:
+        folder_path     = _validate_directory_path(req.folder_path)
+        las_folder_path = _validate_directory_path(req.las_folder_path) if req.las_folder_path else ""
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"status": "error", "message": f"Invalid path: {e}"}
+
+    # validate numeric parameters before they go anywhere near the subprocess
+    _validate_numeric(req.min_confidence, "min_confidence", 0.0, 100.0)
+    _validate_numeric(req.cluster_radius, "cluster_radius",  0.1,  50.0)
+    _validate_numeric(req.batch_size,     "batch_size",      1.0, 128.0)
+
+    if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
         return {"status": "error", "message": "Directory path is invalid or cannot be reached."}
 
     recording_dirs = []
     try:
         # 1. Check if the directory itself is a Recording folder
-        is_direct_recording = any("Camera" in item and os.path.isdir(os.path.join(req.folder_path, item)) for item in os.listdir(req.folder_path))
+        is_direct_recording = any("Camera" in item and os.path.isdir(os.path.join(folder_path, item)) for item in os.listdir(folder_path))
                 
         if is_direct_recording:
             recording_dirs.append({
-                "name": os.path.basename(os.path.normpath(req.folder_path)),
-                "path": req.folder_path
+                "name": os.path.basename(folder_path),
+                "path": folder_path
             })
         else:
             # 2. Iterate as a Master Directory
-            sub_dirs = os.listdir(req.folder_path)
-            for subd in sub_dirs:
-                full_path = os.path.join(req.folder_path, subd)
+            for subd in os.listdir(folder_path):
+                full_path = os.path.join(folder_path, subd)
                 if os.path.isdir(full_path):
                     has_cameras = any("Camera" in inner_d and os.path.isdir(os.path.join(full_path, inner_d)) for inner_d in os.listdir(full_path))
                     
@@ -218,7 +298,7 @@ def start_analysis(req: AnalysisRequest):
             session_id = str(uuid.uuid4())
             st = load_state(session_id)
             st["source_folder"] = rec["path"]
-            st["las_folder"] = req.las_folder_path
+            st["las_folder"] = las_folder_path
             st["is_pending"] = True
             
             dynamic_output_dir = os.path.join(tempfile.gettempdir(), f"Gauss_App_Staging_{session_id}")
@@ -228,7 +308,7 @@ def start_analysis(req: AnalysisRequest):
             
             sessions_started.append({"session_id": session_id, "folder_name": rec["name"], "path": rec["path"]})
             sessions_to_run.append({
-                "session_id": session_id, "folder_path": rec["path"], "las_folder_path": req.las_folder_path, 
+                "session_id": session_id, "folder_path": rec["path"], "las_folder_path": las_folder_path, 
                 "conf": req.min_confidence, "cluster": req.cluster_radius, "batch": req.batch_size, "output": dynamic_output_dir
             })
             
@@ -241,7 +321,7 @@ def start_analysis(req: AnalysisRequest):
             st = load_state(session_id)
             
             st["source_folder"] = rec["path"]
-            st["las_folder"] = req.las_folder_path
+            st["las_folder"] = las_folder_path
             
             dynamic_output_dir = os.path.join(tempfile.gettempdir(), f"Gauss_App_Staging_{session_id}")
             os.makedirs(dynamic_output_dir, exist_ok=True)
@@ -251,7 +331,7 @@ def start_analysis(req: AnalysisRequest):
             
             thread = threading.Thread(
                 target=run_subprocess, 
-                args=(session_id, rec["path"], req.las_folder_path, req.min_confidence, req.cluster_radius, req.batch_size, dynamic_output_dir)
+                args=(session_id, rec["path"], las_folder_path, req.min_confidence, req.cluster_radius, req.batch_size, dynamic_output_dir)
             )
             thread.start()
             
@@ -279,12 +359,24 @@ def get_status(session_id: str):
 
 @app.get("/images/{session_id}/{image_name}")
 def get_image(session_id: str, image_name: str):
+    # validate session_id is a real UUID before using it in file operations
+    session_id = _validate_session_id(session_id)
+
     st = load_state(session_id)
     if not st.get("current_output_dir"):
         return Response(status_code=404)
-    
-    image_path = os.path.join(st["current_output_dir"], image_name)
-    if os.path.exists(image_path):
+
+    output_dir = os.path.realpath(st["current_output_dir"])
+
+    # resolve the full path and then confirm it's still inside the output directory.
+    # without this check, a crafted image_name like '../../etc/passwd' would let
+    # anyone read arbitrary files from the server.
+    image_path = os.path.realpath(os.path.join(output_dir, image_name))
+    if not image_path.startswith(output_dir + os.sep):
+        logger.warning(f"Path traversal attempt blocked: {image_name}")
+        return Response(status_code=400)
+
+    if os.path.exists(image_path) and os.path.isfile(image_path):
         return FileResponse(image_path)
     return Response(status_code=404)
 
@@ -316,7 +408,6 @@ def generate_final_export(req: FinalExportRequest):
     if not final_data:
         return {"status": "error", "message": "No verified detections to export."}
         
-    import pathlib
     df = pd.DataFrame(final_data)
     df.rename(columns={'classification': 'Tip Firida'}, inplace=True)
     geometry = gpd.points_from_xy(df['lon'], df['lat'])

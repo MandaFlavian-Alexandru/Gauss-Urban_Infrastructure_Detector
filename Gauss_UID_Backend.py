@@ -1,23 +1,10 @@
-# Gauss_UID_Backend.py
-#
-# Main processing script for the firida detection pipeline.
-# Takes a recording folder (with Camera1-4 subfolders), runs YOLO on each image,
-# then tries to figure out where each detected firida actually is in the real world
-# using the LiDAR point cloud. Falls back to flat-ground math if LiDAR misses.
-#
-# Quick note on the Z coordinate issue we spent way too long on:
-# The GPS altitude in the coordonate.csv is WGS84 ellipsoidal height (~287m here).
-# The LAS files store orthometric height referenced to the Black Sea datum (~247m).
-# That's a ~39m gap, which means every single ray was flying 39m above the point cloud.
-# We auto-detect this offset at startup by comparing GPS Z to the nearest ground points
-# in the LAS file. For this area of Romania it's consistently around 39.1m.
-
 from __future__ import annotations
 
 import argparse
 import json
 import math
 import os
+import pathlib
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -247,7 +234,7 @@ def _unproject_pixel(u: float, v: float, cfg: PipelineConfig) -> Tuple[float, fl
         # pixel is exactly at the optical centre, just return straight forward
         return 0.0, 0.0, 1.0
 
-    if cfg.fisheye_a0 is not None:
+    if cfg.fisheye_a0 is not None and cfg.fisheye_a2 is not None and cfg.fisheye_a4 is not None:
         # Scaramuzza polynomial model — more accurate, needs calibration data
         rz   = cfg.fisheye_a0 + cfg.fisheye_a2 * r_pix**2 + cfg.fisheye_a4 * r_pix**4
         norm = math.sqrt(dx**2 + dy**2 + rz**2)
@@ -560,8 +547,10 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
         mount_ang = None
         for k, a in cfg.camera_angles.items():
             if k in folder_name:
-                cam_key = k; mount_ang = a; break
-        if cam_key is None:
+                cam_key   = k
+                mount_ang = a
+                break
+        if cam_key is None or mount_ang is None:
             continue
 
         print(f"\n---> {cam_key} (mounted at {mount_ang}° from nose)")
@@ -576,7 +565,8 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
         for fn in os.listdir(folder_path):
             fl = fn.lower()
             if "coordonate" in fl and not fl.startswith("~$"):
-                coord_file = os.path.join(folder_path, fn); break
+                coord_file = os.path.join(folder_path, fn)
+                break
         if not coord_file:
             print(f"  [!] No coordonate file found, skipping {cam_key}.")
             continue
@@ -753,15 +743,21 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
     # save annotated images so you can review what got detected
     for f in unique_firidas:
         if f["clustered"]:
-            color = COLOR_YELLOW; label = f"CLUSTERED: {f['conf']:.2f}"
+            color = COLOR_YELLOW
+            label = f"CLUSTERED: {f['conf']:.2f}"
         elif f["conf"] >= 0.85:
-            color = COLOR_GREEN;  label = f"Firida: {f['conf']:.2f}"
+            color = COLOR_GREEN
+            label = f"Firida: {f['conf']:.2f}"
         elif f["conf"] >= 0.80:
-            color = COLOR_ORANGE; label = f"Firida: {f['conf']:.2f}"
+            color = COLOR_ORANGE
+            label = f"Firida: {f['conf']:.2f}"
         else:
-            color = COLOR_RED;    label = f"WARNING: {f['conf']:.2f}"
-        if not f.get("lidar_hit"):  label += " [PLANAR]"
-        if f.get("px_edge_flag"):   label += " [EDGE]"
+            color = COLOR_RED
+            label = f"WARNING: {f['conf']:.2f}"
+        if not f.get("lidar_hit"):
+            label += " [PLANAR]"
+        if f.get("px_edge_flag"):
+            label += " [EDGE]"
 
         for m in f.get("cluster_members", [f]):
             img = cv2.imread(os.path.join(m["folder_path"], m["image"]))
@@ -795,9 +791,9 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
 
         gdf = gpd.GeoDataFrame(
             df_exp,
-            geometry=[Point(xy) for xy in zip(df_exp["lon"], df_exp["lat"])],
+            geometry=gpd.points_from_xy(df_exp["lon"], df_exp["lat"]),
+            crs="EPSG:4326",
         )
-        gdf.set_crs(epsg=4326, inplace=True)
 
         # quick check that we actually ended up with sensible WGS84 coordinates
         assert gdf.geometry.x.between(-180, 180).all(), (
@@ -806,7 +802,7 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
 
         shp  = os.path.join(cfg.output_folder, "tip_firida_bransament.shp")
         jsn  = os.path.join(cfg.output_folder, "tip_firida_bransament.json")
-        gdf.to_file(shp)
+        gdf.to_file(pathlib.Path(shp))
         df_exp.to_json(jsn, orient="records", indent=2)
         print(f"  Shapefile : {shp}")
         print(f"  JSON      : {jsn}")
