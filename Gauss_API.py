@@ -409,7 +409,35 @@ def generate_final_export(req: FinalExportRequest):
         return {"status": "error", "message": "No verified detections to export."}
         
     df = pd.DataFrame(final_data)
-    df.rename(columns={'classification': 'Tip Firida'}, inplace=True)
+    
+    # Enforce new Enterprise GIS schema
+    df.rename(columns={'classification': 'tip_firida'}, inplace=True)
+    
+    # Inject required empty columns for schema compatibility
+    null_cols = [
+        "id", "id_locatie", "id_linie_j", "tip_strada", "strada", "etaj",
+        "rol_firida", "limita_pro", "pif", "altitudine", "observatii", 
+        "grup_masur", "deleted", "deleted_at", "offl_id", "modificat_", 
+        "modifica_1", "valida_te", "updated_at", "moved_at", "nr_contoar", "cod_bare"
+    ]
+    for col in null_cols:
+        df[col] = ""
+
+    # Ensure 'nr_imobil' is retained if it exists, otherwise add it as empty
+    if 'nr_imobil' not in df.columns:
+        df['nr_imobil'] = "FN"
+
+    # Retain specifically requested metadata columns
+    retain_cols = [
+        "image", "lat", "lon", "lidar_hit", "px_edge_flag", "range_m", "conf", "cam_key", 
+        "tip_firida", "nr_imobil"
+    ] + null_cols
+    
+    # Drop columns not in retain list to ensure strict schema enforcement
+    drop_cols = [c for c in df.columns if c not in retain_cols]
+    if drop_cols:
+        df.drop(columns=drop_cols, inplace=True)
+
     geometry = gpd.points_from_xy(df['lon'], df['lat'])
     gdf = gpd.GeoDataFrame(df, geometry=geometry)
     gdf.set_crs(epsg=4326, inplace=True)

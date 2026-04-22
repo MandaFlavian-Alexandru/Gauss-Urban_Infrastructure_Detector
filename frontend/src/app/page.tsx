@@ -18,6 +18,7 @@ export interface DetectionResult {
   clustered?: boolean;
   verified?: boolean;
   classification?: number;
+  nr_imobil?: string;
 }
 
 export interface Session {
@@ -242,11 +243,18 @@ export default function Home() {
     if (!activeSessionId || !activeSession || !allVerifiedAndClassified) return;
     
     try {
+      const payload = activeSession.resultsData.map(item => {
+        if (!item.nr_imobil || item.nr_imobil.trim() === "") {
+          return { ...item, nr_imobil: "FN" };
+        }
+        return item;
+      });
+
       // Backend generation STRICTLY uses activeSession.resultsData (excluding trashBin logic naturally!)
       const res = await fetch("http://localhost:8000/api/generate_final_export", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: activeSessionId, results: activeSession.resultsData })
+        body: JSON.stringify({ session_id: activeSessionId, results: payload })
       });
       if (!res.ok) throw new Error("Failed to generate export");
       
@@ -331,6 +339,16 @@ export default function Home() {
       if (!s.resultsData[selectedIndex]?.verified) return s;
       const copy = [...s.resultsData];
       copy[selectedIndex] = { ...copy[selectedIndex], classification: type };
+      return { ...s, resultsData: copy };
+    }));
+  }, [selectedIndex, activeSessionId, dashboardViewMode]);
+
+  const handleNrImobilChange = useCallback((value: string) => {
+    if (selectedIndex === null || !activeSessionId || dashboardViewMode === 'trash') return;
+    setSessions(prev => prev.map(s => {
+      if (s.id !== activeSessionId) return s;
+      const copy = [...s.resultsData];
+      copy[selectedIndex] = { ...copy[selectedIndex], nr_imobil: value };
       return { ...s, resultsData: copy };
     }));
   }, [selectedIndex, activeSessionId, dashboardViewMode]);
@@ -752,6 +770,23 @@ export default function Home() {
                           {type.label}
                         </button>
                       ))}
+                    </div>
+                    
+                    <div className="mt-2 flex items-center gap-2">
+                      <label className="text-[10px] uppercase font-bold text-gray-300 w-16">Nr. Imobil</label>
+                      <input 
+                        type="text" 
+                        value={currentImageArray[selectedIndex].nr_imobil || ""}
+                        onChange={(e) => {
+                          e.stopPropagation();
+                          handleNrImobilChange(e.target.value);
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                        onKeyDown={(e) => e.stopPropagation()}
+                        disabled={!currentImageArray[selectedIndex].verified}
+                        placeholder="FN"
+                        className="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs text-white placeholder-gray-500 focus:border-brand-primary focus:outline-none disabled:opacity-30 disabled:cursor-not-allowed"
+                      />
                     </div>
                   </div>
 
