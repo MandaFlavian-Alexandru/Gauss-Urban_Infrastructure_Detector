@@ -1,14 +1,5 @@
-Refactor coordinate schema: Migrate from WGS84 to native Stereo70 (EPSG:3844) with Z-axis
+docs: Add deep-dive spatial architecture documentation and revamp README
 
-Backend (Gauss_UID_Backend.py, Gauss_API.py):
-- Removed pyproj `_stereo70_to_wgs84` transformation.
-- `_raycast_pixel` now retains and returns raw `x`, `y`, and orthometric `z` coordinates.
-- Replaced spherical `haversine_distance` with planar `euclidean_distance` for accurate cluster deduplication in meters.
-- GeoDataFrames now initialize and export directly in EPSG:3844 (Pulkovo 1942(58) / Stereo 70).
-- Shapefiles and JSON outputs now naturally embed `x`, `y`, and `z` values matching strict enterprise GIS schemas.
-
-Frontend (MapView.tsx, page.tsx):
-- Integrated `proj4` and `@types/proj4` dependencies to gracefully handle dynamic coordinate reprojection.
-- UI layer transparently converts Stereo70 API data to WGS84 exclusively for `react-leaflet` OpenStreetMap visualization.
-- `DetectionResult` interface updated from `lat`/`lon` to `x`, `y`, and `z`.
-- Added orthometric Z altitude display to the map UI popups.
+- Added `docs/technical/01_lidar_3d_raycasting.md` offering an in-depth human-readable explanation of the KDTree intersection, camera unprojection, and dynamic Geoid undulation calibration logic.
+- Added `docs/technical/02_planar_fallback_geometry.md` detailing the flat-earth trigonometric failover for occluded point-cloud targets.
+- Completely refactored the `README.md` to be highly professional and enterprise-ready, outlining the dual-stack architecture (Python FastAPI Backend + Next.js Frontend), Stereo70 native integration, and clear setup instructions.
