@@ -82,7 +82,6 @@ COLOR_RED    = (0,   0, 255)   # low confidence, worth reviewing
 COLOR_YELLOW = (0, 255, 255)   # clustered — seen from multiple angles
 
 # single shared transformer, no need to recreate it every call
-_stereo70_to_wgs84 = pyproj.Transformer.from_crs("EPSG:3844", "EPSG:4326", always_xy=True)
 
 
 # ---
@@ -347,7 +346,7 @@ def calculate_gps_offset_3d(
     # the flat-ground fallback would give a nonsensical result (negative time).
     # just skip it.
     if ry <= 0:
-        return {"lat": None, "lon": None, "lidar_hit": False,
+        return {"x": None, "y": None, "z": None, "lidar_hit": False,
                 "px_edge_flag": px_edge_flag, "range_m": None,
                 "true_heading_deg": None}
 
@@ -408,9 +407,7 @@ def calculate_gps_offset_3d(
             origin_z,
         ], dtype=np.float64)
 
-    lon, lat = _stereo70_to_wgs84.transform(float(centroid_xyz[0]), float(centroid_xyz[1]))
-
-    return {"lat": lat, "lon": lon, "lidar_hit": lidar_hit,
+    return {"x": float(centroid_xyz[0]), "y": float(centroid_xyz[1]), "z": float(centroid_xyz[2]), "lidar_hit": lidar_hit,
             "px_edge_flag": px_edge_flag, "range_m": range_m,
             "true_heading_deg": true_heading_deg}
 
@@ -419,15 +416,9 @@ def calculate_gps_offset_3d(
 # Helpers
 # ---
 
-def haversine_distance(lat1, lon1, lat2, lon2) -> float:
-    """Straight-line distance in metres between two lat/lon points."""
-    R    = 6_378_137.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a    = (math.sin(dlat/2)**2
-            + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
-            * math.sin(dlon/2)**2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+def euclidean_distance(x1, y1, x2, y2) -> float:
+    """Straight-line 2D distance in metres between two points."""
+    return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
 
 
 def _check_heading_convention(samples: list, cfg: PipelineConfig) -> None:
@@ -621,7 +612,7 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                     kdtree, points, cfg, geoid_undulation,
                 )
 
-                if geo["lat"] is None:
+                if geo["x"] is None:
                     # ray was pointing upward, nothing we can do with this one
                     continue
 
@@ -632,8 +623,9 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
                     "x1": int(x1), "y1": int(y1),
                     "x2": int(x2), "y2": int(y2),
                     "conf":         conf,
-                    "lat":          geo["lat"],
-                    "lon":          geo["lon"],
+                    "x":            geo["x"],
+                    "y":            geo["y"],
+                    "z":            geo["z"],
                     "lidar_hit":    geo["lidar_hit"],     # True = sub-metre accuracy
                     "px_edge_flag": geo["px_edge_flag"],  # True = near frame edge, less accurate
                     "range_m":      geo["range_m"],       # how far the ray travelled to hit something
@@ -660,7 +652,7 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
     for det in all_detections:
         matched = False
         for uf in unique_firidas:
-            dist = haversine_distance(det["lat"], det["lon"], uf["lat"], uf["lon"])
+            dist = euclidean_distance(det["x"], det["y"], uf["x"], uf["y"])
             if dist <= cfg.cluster_radius_m:
                 # same image, same camera — definitely a duplicate, just skip it
                 if det["image"] == uf["image"] and det["cam_key"] == uf["cam_key"]:
@@ -709,7 +701,7 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
             while j < len(unique_firidas):
                 fi = unique_firidas[i]
                 fj = unique_firidas[j]
-                dist = haversine_distance(fi["lat"], fi["lon"], fj["lat"], fj["lon"])
+                dist = euclidean_distance(fi["x"], fi["y"], fj["x"], fj["y"])
                 if dist <= cfg.cross_camera_radius_m:
                     # merge fj into fi — combine their photo lists
                     if "cluster_members" not in fi:
@@ -791,14 +783,10 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
 
         gdf = gpd.GeoDataFrame(
             df_exp,
-            geometry=gpd.points_from_xy(df_exp["lon"], df_exp["lat"]),
-            crs="EPSG:4326",
+            geometry=gpd.points_from_xy(df_exp["x"], df_exp["y"], z=df_exp["z"]),
+            crs="EPSG:3844",
         )
 
-        # quick check that we actually ended up with sensible WGS84 coordinates
-        assert gdf.geometry.x.between(-180, 180).all(), (
-            "Got longitudes outside the WGS84 range — the Stereo70 to WGS84 "
-            "transform probably didn't run correctly.")
 
         shp  = os.path.join(cfg.output_folder, "tip_firida_bransament.shp")
         jsn  = os.path.join(cfg.output_folder, "tip_firida_bransament.json")

@@ -13,8 +13,9 @@ export interface DetectionResult {
   x2?: number;
   y2?: number;
   conf: number;
-  lat: number;
-  lon: number;
+  x: number;
+  y: number;
+  z: number;
   clustered?: boolean;
   verified?: boolean;
   classification?: number;

@@ -429,7 +429,7 @@ def generate_final_export(req: FinalExportRequest):
 
     # Retain specifically requested metadata columns
     retain_cols = [
-        "image", "lat", "lon", "lidar_hit", "px_edge_flag", "range_m", "conf", "cam_key", 
+        "image", "x", "y", "z", "lidar_hit", "px_edge_flag", "range_m", "conf", "cam_key", 
         "tip_firida", "nr_imobil"
     ] + null_cols
     
@@ -438,9 +438,9 @@ def generate_final_export(req: FinalExportRequest):
     if drop_cols:
         df.drop(columns=drop_cols, inplace=True)
 
-    geometry = gpd.points_from_xy(df['lon'], df['lat'])
+    geometry = gpd.points_from_xy(df['x'], df['y'], z=df['z'])
     gdf = gpd.GeoDataFrame(df, geometry=geometry)
-    gdf.set_crs(epsg=4326, inplace=True)
+    gdf.set_crs(epsg=3844, inplace=True)
     
     base_name = "tip_firida_bransament"
     
