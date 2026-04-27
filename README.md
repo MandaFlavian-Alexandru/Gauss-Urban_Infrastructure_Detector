@@ -18,7 +18,7 @@ Built for precision engineering and large-scale utility cadastre, the platform c
 
 ---
 
-## ✨ Enterprise Capabilities
+## I Enterprise Capabilities
 
 *   **Sub-Centimeter Accuracy:** Translates 2D camera pixels into native 3D Stereo70 (EPSG:3844) spatial coordinates using an advanced LiDAR KDTree intersection algorithm.
 *   **Intelligent Planar Fallback:** Guarantees zero data loss by seamlessly falling back to flat-earth trigonometric estimation if the LiDAR pulse is occluded.
@@ -28,17 +28,17 @@ Built for precision engineering and large-scale utility cadastre, the platform c
 
 ---
 
-## 🏗️ System Architecture
+## II System Architecture
 
 The suite operates on a decoupled, high-performance dual-stack architecture designed to handle massive volumes of panoramic Ladybug 5 survey data.
 
-### 🧠 The Inference Engine (Python / FastAPI)
+### III The Inference Engine (Python / FastAPI)
 The heavy-lifting backend runs on a finely-tuned YOLOv8 neural network (`firida_detector_v4_verygood.pt`), orchestrated by a FastAPI cluster.
 *   **Asynchronous Processing:** Spawns isolated, multi-threaded background workers to crunch gigabytes of imagery and telemetry without locking the main thread.
 *   **Spatial Mathematics:** Handles complex unprojection math, dynamic Geoid undulation calibration, and LiDAR raycasting entirely in memory.
 *   **Strict Metric Schema:** The engine never breaks projection. It calculates, clusters, and exports purely in metric Stereo70 coordinates, preserving the true physical elevation (Orthometric Z).
 
-### 🖥️ The Verification Console (Next.js / React)
+### IV The Verification Console (Next.js / React)
 A stunning, responsive web dashboard built for speed and operational efficiency.
 *   **Live Batch Telemetry:** Watch the AI engine tear through folders with real-time progress bars and terminal logs streamed directly to your browser.
 *   **Dynamic Cartography:** Powered by `proj4` and `react-leaflet`, the dashboard re-projects the backend's strict metric payloads into WGS84 on-the-fly, providing beautiful, interactive OpenStreetMap visualizations.
@@ -46,7 +46,7 @@ A stunning, responsive web dashboard built for speed and operational efficiency.
 
 ---
 
-## 📚 Technical Deep Dives
+## V Technical Deep Dives
 
 Curious about the math behind the magic? Review our internal architecture documentation:
 
@@ -55,7 +55,7 @@ Curious about the math behind the magic? Review our internal architecture docume
 
 ---
 
-## 🚀 Deployment Guide
+## VI Deployment Guide
 
 Getting the platform running on a new workstation is highly streamlined. 
 
