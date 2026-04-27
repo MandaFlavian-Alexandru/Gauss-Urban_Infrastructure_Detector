@@ -1,95 +1,99 @@
-# Gauss Urban Infrastructure Detector
+<div align="center">
+  <img src="frontend/public/gauss_logo.png" alt="Gauss Logo" width="300" />
+  <h1>Urban Infrastructure Detector</h1>
+  <p><strong>Next-Generation Spatial Intelligence & Computer Vision Platform</strong></p>
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-00a393?style=for-the-badge&logo=fastapi)
-![Next.js](https://img.shields.io/badge/Next.js-14%2B-black?style=for-the-badge&logo=next.js)
-![LiDAR](https://img.shields.io/badge/LiDAR-KDTree_Engine-red?style=for-the-badge)
-![License](https://img.shields.io/badge/License-Proprietary-darkred?style=for-the-badge)
+  ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python&logoColor=white)
+  ![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-00a393?style=for-the-badge&logo=fastapi&logoColor=white)
+  ![Next.js 14+](https://img.shields.io/badge/Next.js-14%2B-black?style=for-the-badge&logo=next.js&logoColor=white)
+  ![LiDAR Raycasting](https://img.shields.io/badge/Engine-3D_LiDAR_Raycasting-red?style=for-the-badge)
+  ![License Proprietary](https://img.shields.io/badge/License-Proprietary-darkred?style=for-the-badge)
+</div>
 
-An enterprise-grade computer vision and geospatial mapping suite engineered to process Ladybug 5 panoramic imagery and automatically detect, classify, and geographically anchor electrical distribution boxes (*firidas*).
+<br/>
 
-Designed for high-precision surveying, the platform fuses AI object detection with dense LiDAR point clouds to extract sub-centimeter 3D spatial intelligence, exporting directly to strict enterprise GIS schemas.
+The **Gauss Urban Infrastructure Detector** is an enterprise-grade spatial intelligence suite engineered to automatically detect, classify, and geographically anchor electrical distribution boxes (*firidas*) from high-speed panoramic mobile mapping surveys.
 
----
-
-## 🏗️ Architecture Overview
-
-The Gauss Infrastructure Detector operates on a dual-stack architecture designed for robust, asynchronous processing and elegant human-in-the-loop verification.
-
-### AI & Geospatial Backend (Python / FastAPI)
-The core engine relies on a fine-tuned YOLOv8 model (`firida_detector_v4_verygood.pt`) for high-resolution optical detection. Its true power, however, lies in its spatial processing capabilities:
-- **3D LiDAR Raycasting:** Unprojects 2D bounding boxes into 3D vectors and casts virtual cylinders into a KDTree of the LiDAR point cloud to extract precise XYZ coordinates. 
-- **Planar Fallback:** Intelligently drops down to flat-earth trigonometric estimation if the point cloud is occluded or too sparse.
-- **Euclidean Clustering:** Deduplicates infrastructure seen from multiple camera angles using planar mathematics natively in the Stereo70 coordinate system.
-- **Strict GIS Export:** Generates QGIS-ready shapefiles (PointZ) locked to the EPSG:3844 (Pulkovo 1942 / Stereo 70) projection, rigorously enforcing a 24-column enterprise metadata schema.
-
-### Verification Console (Next.js / React)
-A modern, responsive web application serving as the operator's dashboard:
-- **Live Telemetry:** Tracks running Python subprocesses and multi-camera scanning progress in real-time.
-- **Interactive Triage:** Allows operators to rapidly verify AI detections, assign metadata (like house numbers), and soft-delete false positives using a streamlined Lightbox gallery.
-- **Dynamic Cartography:** Utilizes `proj4` and `react-leaflet` to seamlessly re-project Stereo70 payloads into WGS84 on the fly for OpenStreetMap visualization without compromising the backend's strict metric schema.
+Built for precision engineering and large-scale utility cadastre, the platform completely automates the extraction of sub-centimeter 3D spatial data. By fusing state-of-the-art AI object detection with dense LiDAR point clouds, Gauss eliminates hundreds of hours of manual digitization, exporting directly into strict enterprise GIS workflows.
 
 ---
 
-## 📚 Technical Documentation
+## ✨ Enterprise Capabilities
 
-For a deep dive into the mathematics and algorithms powering our spatial engine, refer to our architecture documentation:
-
-- 📖 [The 3D LiDAR Raycasting Engine](docs/technical/01_lidar_3d_raycasting.md) - *Explains camera unprojection, geoid calibration, and KDTree intersection.*
-- 📖 [Planar Fallback Geometry](docs/technical/02_planar_fallback_geometry.md) - *Explains the flat-earth trigonometric failover for occluded targets.*
+*   **Sub-Centimeter Accuracy:** Translates 2D camera pixels into native 3D Stereo70 (EPSG:3844) spatial coordinates using an advanced LiDAR KDTree intersection algorithm.
+*   **Intelligent Planar Fallback:** Guarantees zero data loss by seamlessly falling back to flat-earth trigonometric estimation if the LiDAR pulse is occluded.
+*   **Automated Deduplication:** Cross-references detections across multiple overlapping camera feeds using highly optimized planar Euclidean clustering.
+*   **Human-in-the-Loop Verification:** Includes a lightning-fast, modern Next.js console allowing operators to triage, verify, and attach metadata to AI predictions before final export.
+*   **Turnkey GIS Integration:** Generates pure QGIS/ArcGIS-ready shapefiles (PointZ) enforcing rigid, 24-column utility cadastre schemas out of the box.
 
 ---
 
-## 🚀 Quick Start Guide
+## 🏗️ System Architecture
 
-Ensure you have Python 3.10+ and Node.js v18+ installed on your system.
+The suite operates on a decoupled, high-performance dual-stack architecture designed to handle massive volumes of panoramic Ladybug 5 survey data.
 
-### 1. Initialize the Python Backend
-The backend utilizes isolated virtual environments to prevent system-level package conflicts.
+### 🧠 The Inference Engine (Python / FastAPI)
+The heavy-lifting backend runs on a finely-tuned YOLOv8 neural network (`firida_detector_v4_verygood.pt`), orchestrated by a FastAPI cluster.
+*   **Asynchronous Processing:** Spawns isolated, multi-threaded background workers to crunch gigabytes of imagery and telemetry without locking the main thread.
+*   **Spatial Mathematics:** Handles complex unprojection math, dynamic Geoid undulation calibration, and LiDAR raycasting entirely in memory.
+*   **Strict Metric Schema:** The engine never breaks projection. It calculates, clusters, and exports purely in metric Stereo70 coordinates, preserving the true physical elevation (Orthometric Z).
+
+### 🖥️ The Verification Console (Next.js / React)
+A stunning, responsive web dashboard built for speed and operational efficiency.
+*   **Live Batch Telemetry:** Watch the AI engine tear through folders with real-time progress bars and terminal logs streamed directly to your browser.
+*   **Dynamic Cartography:** Powered by `proj4` and `react-leaflet`, the dashboard re-projects the backend's strict metric payloads into WGS84 on-the-fly, providing beautiful, interactive OpenStreetMap visualizations.
+*   **Triage Workflow:** A streamlined lightbox gallery lets operators hit the spacebar to instantly verify targets, attach house numbers (`Nr. Imobil`), and soft-delete anomalies.
+
+---
+
+## 📚 Technical Deep Dives
+
+Curious about the math behind the magic? Review our internal architecture documentation:
+
+*   [**The 3D LiDAR Raycasting Engine**](docs/technical/01_lidar_3d_raycasting.md) — *Learn how we unproject camera pixels, calibrate the Geoid offset dynamically, and strike targets inside a KDTree.*
+*   [**Planar Fallback Geometry**](docs/technical/02_planar_fallback_geometry.md) — *Discover our fail-safe trigonometric approach for handling occluded LiDAR targets.*
+
+---
+
+## 🚀 Deployment Guide
+
+Getting the platform running on a new workstation is highly streamlined. 
+
+### 1. Boot the Inference Engine
+We isolate the Python backend in a virtual environment to ensure zero conflicts with existing system libraries.
 
 ```bash
-# Clone the repository and setup the environment
+# Clone the repository
 git clone https://github.com/MandaFlavian-Alexandru/Gauss-Urban_Infrastructure_Detector.git
 cd Gauss-Urban_Infrastructure_Detector
 
-# Create and activate a virtual environment
+# Create and activate a secure virtual environment
 python -m venv .venv
-.\.venv\Scripts\activate
+.\.venv\Scripts\activate   # On Linux/Mac: source .venv/bin/activate
 
-# Install core dependencies
+# Install the AI and geospatial dependencies
 pip install -r requirements.txt
 
 # Launch the FastAPI cluster
 uvicorn Gauss_API:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### 2. Initialize the Next.js Frontend
-Open a **new terminal window**, leaving the Python backend running in the background.
+### 2. Launch the Verification Console
+Open a **new terminal window** and leave the Python engine running in the background.
 
 ```bash
 cd frontend
 
-# Install UI dependencies (including Leaflet and Proj4)
+# Install the Next.js UI packages (including Leaflet and Proj4)
 npm install
 
-# Launch the development server
+# Start the interactive dashboard
 npm run dev
 ```
 
-Navigate to `http://localhost:3000` in your web browser to access the Verification Console.
+Finally, open your browser and navigate to `http://localhost:3000` to access the Gauss command center.
 
 ---
-
-## 📡 Core API Capabilities
-
-The backend exposes a suite of endpoints designed to orchestrate the LiDAR engine:
-
-- `POST /api/analyze` - Spawns an asynchronous inference worker, feeding Ladybug 5 imagery and telemetry through the YOLO and KDTree pipelines.
-- `GET /api/status` - Streams real-time execution telemetry and granular camera progress back to the Next.js dashboard.
-- `GET /images/{image_name}` - Dynamically serves annotated validation imagery out of temporary staging directories.
-- `POST /api/generate_final_export` - Receives verified targets from the frontend, enforces the 24-column enterprise schema, and compiles the definitive spatial dataset.
-- `GET /api/download_shapefile` - Packages the finalized `.shp`, `.shx`, `.dbf`, `.cpg`, `.prj`, and `.json` deliverables into a downloadable ZIP archive.
-
----
-
-*Engineered by Gauss for superior urban intelligence.*
+<div align="center">
+  <i>Engineered by Gauss for superior urban intelligence.</i>
+</div>
