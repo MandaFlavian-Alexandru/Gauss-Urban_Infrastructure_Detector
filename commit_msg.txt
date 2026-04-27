@@ -1,5 +1,0 @@
-docs: Add deep-dive spatial architecture documentation and revamp README
-
-- Added `docs/technical/01_lidar_3d_raycasting.md` offering an in-depth human-readable explanation of the KDTree intersection, camera unprojection, and dynamic Geoid undulation calibration logic.
-- Added `docs/technical/02_planar_fallback_geometry.md` detailing the flat-earth trigonometric failover for occluded point-cloud targets.
-- Completely refactored the `README.md` to be highly professional and enterprise-ready, outlining the dual-stack architecture (Python FastAPI Backend + Next.js Frontend), Stereo70 native integration, and clear setup instructions.
