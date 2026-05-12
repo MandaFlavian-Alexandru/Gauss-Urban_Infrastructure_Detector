@@ -10,6 +10,14 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
+# Restrict threading at the C/C++ level BEFORE importing heavy numerical libraries
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "4"
+os.environ["NUMEXPR_NUM_THREADS"] = "4"
+
+
 import cv2
 import geopandas as gpd
 import laspy
@@ -586,6 +594,7 @@ def run_enterprise_pipeline(cfg: PipelineConfig) -> None:
             source=folder_path, conf=cfg.confidence, iou=cfg.iou_threshold,
             imgsz=cfg.image_width, augment=cfg.use_tta, half=use_half,
             device=device, stream=True, verbose=False, batch=cfg.batch_size,
+            workers=0,
         )
 
         n_det = 0
