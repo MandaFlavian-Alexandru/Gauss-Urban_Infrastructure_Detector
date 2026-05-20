@@ -412,28 +412,19 @@ def generate_final_export(req: FinalExportRequest):
     
     # Enforce new Enterprise GIS schema
     df.rename(columns={'classification': 'tip_firida'}, inplace=True)
+    df.rename(columns={'tip_firida': 'tip_firida_bransament'}, inplace=True)
     
-    # Inject required empty columns for schema compatibility
-    null_cols = [
-        "id", "id_locatie", "id_linie_j", "tip_strada", "strada", "etaj",
-        "rol_firida", "limita_pro", "pif", "altitudine", "observatii", 
-        "grup_masur", "deleted", "deleted_at", "offl_id", "modificat_", 
-        "modifica_1", "valida_te", "updated_at", "moved_at", "nr_contoar", "cod_bare"
-    ]
-    for col in null_cols:
-        df[col] = ""
-
-    # Ensure 'nr_imobil' is retained if it exists, otherwise add it as empty
+    # Ensure 'nr_imobil' exists
     if 'nr_imobil' not in df.columns:
         df['nr_imobil'] = "FN"
 
-    # Retain specifically requested metadata columns
-    retain_cols = [
-        "image", "x", "y", "z", "lidar_hit", "px_edge_flag", "range_m", "conf", "cam_key", 
-        "tip_firida", "nr_imobil"
-    ] + null_cols
-    
-    # Drop columns not in retain list to ensure strict schema enforcement
+    # Round coordinates to 4 decimal places
+    for col in ('x', 'y', 'z'):
+        if col in df.columns:
+            df[col] = df[col].round(4)
+
+    # Final schema: only two attribute columns (+ coordinates for geometry)
+    retain_cols = ["x", "y", "z", "tip_firida_bransament", "nr_imobil"]
     drop_cols = [c for c in df.columns if c not in retain_cols]
     if drop_cols:
         df.drop(columns=drop_cols, inplace=True)
@@ -441,15 +432,16 @@ def generate_final_export(req: FinalExportRequest):
     geometry = gpd.points_from_xy(df['x'], df['y'], z=df['z'])
     gdf = gpd.GeoDataFrame(df, geometry=geometry)
     gdf.set_crs(epsg=3844, inplace=True)
-    
+    gdf.drop(columns=['x', 'y', 'z'], inplace=True)
+
     base_name = "tip_firida_bransament"
-    
+
     json_path = os.path.join(st["current_output_dir"], f"{base_name}.json")
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(final_data, f)
-        
-    shp_path = os.path.join(st["current_output_dir"], f"{base_name}.shp")
-    gdf.to_file(pathlib.Path(shp_path))
+
+    geojson_path = os.path.join(st["current_output_dir"], f"{base_name}.geojson")
+    gdf.to_file(pathlib.Path(geojson_path), driver="GeoJSON")
     
     return {"status": "success"}
 
@@ -459,16 +451,16 @@ def download_shapefile(session_id: str):
     target_dir = st["current_output_dir"]
     base_name = "tip_firida_bransament"
     
-    if not target_dir or not os.path.exists(os.path.join(target_dir, f"{base_name}.shp")):
-        return Response(content="Shapefile not generated yet", status_code=404)
-        
+    if not target_dir or not os.path.exists(os.path.join(target_dir, f"{base_name}.geojson")):
+        return Response(content="GeoJSON not generated yet", status_code=404)
+
     desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
     final_output_dir = os.path.join(desktop_path, f"Gauss_Results_{session_id}")
     os.makedirs(final_output_dir, exist_ok=True)
-    
+
     zip_path = os.path.join(final_output_dir, f"{base_name}.zip")
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg', '.json']:
+        for ext in ['.geojson', '.json']:
             file_path = os.path.join(target_dir, f"{base_name}{ext}")
             if os.path.exists(file_path):
                 import shutil
